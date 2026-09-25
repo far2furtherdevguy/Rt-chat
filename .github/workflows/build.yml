@@ -26,7 +26,6 @@ jobs:
       GOOGLE_WEB_CLIENT_ID: ${{ secrets.GOOGLE_WEB_CLIENT_ID }}
       GIPHY_API_KEY: ${{ secrets.GIPHY_API_KEY }}
       MAX_UPLOAD_MB: ${{ vars.MAX_UPLOAD_MB || '25' }}
-      # Keep these in sync with the values forced in the Android patch step below.
       ANDROID_COMPILE_SDK: '36'
       ANDROID_TARGET_SDK: '36'
       ANDROID_MIN_SDK: '23'
@@ -42,7 +41,7 @@ jobs:
             if [ -z "${!v}" ]; then missing="$missing $v"; fi
           done
           if [ -n "$missing" ]; then
-            echo "::warning::Missing secrets:$missing - the APK will build but show a 'Setup needed' screen. See README.md."
+            echo "::warning::Missing secrets:$missing - the APK will build but show a Setup needed screen. See README.md."
           fi
 
       - name: Set up Java
@@ -57,7 +56,6 @@ jobs:
           channel: stable
           cache: true
 
-      # Caching Gradle + Maven downloads avoids Maven Central / Google Maven rate limits on repeat builds.
       - name: Cache Gradle and Maven downloads
         uses: actions/cache@v4
         with:
@@ -69,8 +67,6 @@ jobs:
           restore-keys: |
             gradle-${{ runner.os }}-
 
-      # Google Sign-In only works if the APK is signed with a key whose SHA-1 is registered in Firebase.
-      # Keeping the same debug keystore between runs keeps that SHA-1 stable.
       - name: Restore signing keystore
         id: ks
         uses: actions/cache@v4
@@ -97,8 +93,6 @@ jobs:
             echo "Package name: \`com.rtchat.rt_chat\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # The repo only holds Dart code. The Android project is generated here, so there are no
-      # missing gradle/scaffold directory errors.
       - name: Create Android scaffold (if missing)
         run: |
           if [ ! -d android ]; then
@@ -108,102 +102,105 @@ jobs:
           mkdir -p android/app/src/main
           ls android
 
-          - name: Patch Android project (label, permissions, SDK levels, desugaring)
-            run: |
-          python3 - <<'PY'
+      - name: Patch Android project (label, permissions, SDK levels, desugaring)
+        run: |
+          python3 << 'PY'
           import os, re, pathlib, textwrap
-          root = pathlib.Path('android')
-          compile_sdk = os.environ.get('ANDROID_COMPILE_SDK', '36')
-          target_sdk = os.environ.get('ANDROID_TARGET_SDK', '36')
-          min_sdk = os.environ.get('ANDROID_MIN_SDK', '23')
+          root = pathlib.Path("android")
+          compile_sdk = os.environ.get("ANDROID_COMPILE_SDK", "36")
+          target_sdk = os.environ.get("ANDROID_TARGET_SDK", "36")
+          min_sdk = os.environ.get("ANDROID_MIN_SDK", "23")
 
           # Manifest: app name + permissions
-          mf = root / 'app/src/main/AndroidManifest.xml'
+          mf = root / "app/src/main/AndroidManifest.xml"
           s = mf.read_text()
           s = re.sub(r'android:label="[^"]*"', 'android:label="RT Chat"', s, count=1)
           perms = [
-              'android.permission.INTERNET',
-              'android.permission.POST_NOTIFICATIONS',
-              'android.permission.VIBRATE',
+              "android.permission.INTERNET",
+              "android.permission.POST_NOTIFICATIONS",
+              "android.permission.VIBRATE",
           ]
-          add_p = ''.join('    <uses-permission android:name="%s"/>\n' % p for p in perms if p not in s)
-          s = s.replace('<application', add_p + '    <application', 1)
+          add_p = "".join('    <uses-permission android:name="%s"/>\n' % p for p in perms if p not in s)
+          s = s.replace("<application", add_p + "    <application", 1)
           mf.write_text(s)
 
           # App-level gradle (Kotlin DSL or Groovy)
           g = None
-          for name in ('build.gradle.kts', 'build.gradle'):
-              cand = root / 'app' / name
+          for name in ("build.gradle.kts", "build.gradle"):
+              cand = root / "app" / name
               if cand.exists():
                   g = cand
                   break
           if g is None:
-              raise SystemExit('android/app/build.gradle(.kts) not found')
-          kts = g.name.endswith('.kts')
+              raise SystemExit("android/app/build.gradle(.kts) not found")
+          kts = g.name.endswith(".kts")
           t = g.read_text()
 
           def force_sdk(text, prop, version_prop, value):
               if kts:
-                  if re.search(rf'(?m)^\s*{prop}\s*=', text):
-                      text = re.sub(rf'(?m)^(\s*){prop}\s*=\s*[^\n]+', rf'\1{prop} = {value}', text, count=1)
-                  elif re.search(rf'(?m)^\s*{version_prop}\s*=', text):
-                      text = re.sub(rf'(?m)^(\s*){version_prop}\s*=\s*[^\n]+', rf'\1{prop} = {value}', text, count=1)
+                  if re.search(rf"(?m)^\s*{prop}\s*=", text):
+                      text = re.sub(rf"(?m)^(\s*){prop}\s*=\s*[^\n]+", rf"\1{prop} = {value}", text, count=1)
+                  elif re.search(rf"(?m)^\s*{version_prop}\s*=", text):
+                      text = re.sub(rf"(?m)^(\s*){version_prop}\s*=\s*[^\n]+", rf"\1{prop} = {value}", text, count=1)
                   else:
-                      text = re.sub(r'(android\s*\{)', rf'\1\n    {prop} = {value}', text, count=1)
+                      text = re.sub(r"(android\s*\{)", rf"\1\n    {prop} = {value}", text, count=1)
               else:
-                  if re.search(rf'(?m)^\s*{version_prop}\s+', text):
-                      text = re.sub(rf'(?m)^(\s*){version_prop}\s+[^\n]+', rf'\1{version_prop} {value}', text, count=1)
-                  elif re.search(rf'(?m)^\s*{prop}\s+', text):
-                      text = re.sub(rf'(?m)^(\s*){prop}\s+[^\n]+', rf'\1{prop} {value}', text, count=1)
+                  if re.search(rf"(?m)^\s*{version_prop}\s+", text):
+                      text = re.sub(rf"(?m)^(\s*){version_prop}\s+[^\n]+", rf"\1{version_prop} {value}", text, count=1)
+                  elif re.search(rf"(?m)^\s*{prop}\s+", text):
+                      text = re.sub(rf"(?m)^(\s*){prop}\s+[^\n]+", rf"\1{prop} {value}", text, count=1)
                   else:
-                      text = re.sub(r'(android\s*\{)', rf'\1\n    {version_prop} {value}', text, count=1)
+                      text = re.sub(r"(android\s*\{)", rf"\1\n    {version_prop} {value}", text, count=1)
               return text
 
-          t = force_sdk(t, 'compileSdk', 'compileSdkVersion', compile_sdk)
-          t = force_sdk(t, 'targetSdk', 'targetSdkVersion', target_sdk)
-          t = force_sdk(t, 'minSdk', 'minSdkVersion', min_sdk)
-          t = re.sub(r'flutter\.compileSdkVersion', compile_sdk, t)
-          t = re.sub(r'flutter\.targetSdkVersion', target_sdk, t)
-          t = re.sub(r'flutter\.minSdkVersion', min_sdk, t)
+          t = force_sdk(t, "compileSdk", "compileSdkVersion", compile_sdk)
+          t = force_sdk(t, "targetSdk", "targetSdkVersion", target_sdk)
+          t = force_sdk(t, "minSdk", "minSdkVersion", min_sdk)
+          t = re.sub(r"flutter\.compileSdkVersion", compile_sdk, t)
+          t = re.sub(r"flutter\.targetSdkVersion", target_sdk, t)
+          t = re.sub(r"flutter\.minSdkVersion", min_sdk, t)
 
-          if 'coreLibraryDesugaring' not in t and 'isCoreLibraryDesugaringEnabled' not in t:
-              flag = 'isCoreLibraryDesugaringEnabled = true' if kts else 'coreLibraryDesugaringEnabled true'
-              if re.search(r'compileOptions\s*\{', t):
-                  t = re.sub(r'compileOptions\s*\{', lambda m: m.group(0) + '\n        ' + flag, t, count=1)
+          if "coreLibraryDesugaring" not in t and "isCoreLibraryDesugaringEnabled" not in t:
+              flag = "isCoreLibraryDesugaringEnabled = true" if kts else "coreLibraryDesugaringEnabled true"
+              if re.search(r"compileOptions\s*\{", t):
+                  t = re.sub(r"compileOptions\s*\{", lambda m: m.group(0) + "\n        " + flag, t, count=1)
               else:
-                  inject = (
-                      f'\n    compileOptions {{\n        {flag}\n'
-                      f'        sourceCompatibility = JavaVersion.VERSION_17\n'
-                      f'        targetCompatibility = JavaVersion.VERSION_17\n    }}\n'
-                      if kts else
-                      f'\n    compileOptions {{\n        {flag}\n'
-                      f'        sourceCompatibility JavaVersion.VERSION_17\n'
-                      f'        targetCompatibility JavaVersion.VERSION_17\n    }}\n'
-                  )
-                  t = re.sub(r'(android\s*\{)', r'\1' + inject, t, count=1)
+                  if kts:
+                      inject = (
+                          "\n    compileOptions {\n        " + flag + "\n"
+                          "        sourceCompatibility = JavaVersion.VERSION_17\n"
+                          "        targetCompatibility = JavaVersion.VERSION_17\n    }\n"
+                      )
+                  else:
+                      inject = (
+                          "\n    compileOptions {\n        " + flag + "\n"
+                          "        sourceCompatibility JavaVersion.VERSION_17\n"
+                          "        targetCompatibility JavaVersion.VERSION_17\n    }\n"
+                      )
+                  t = re.sub(r"(android\s*\{)", r"\1" + inject, t, count=1)
               dep = (
                   'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")'
-                  if kts else
-                  "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'"
+                  if kts
+                  else "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'"
               )
-              if re.search(r'dependencies\s*\{', t):
-                  t = re.sub(r'dependencies\s*\{', lambda m: m.group(0) + '\n    ' + dep, t, count=1)
+              if re.search(r"dependencies\s*\{", t):
+                  t = re.sub(r"dependencies\s*\{", lambda m: m.group(0) + "\n    " + dep, t, count=1)
               else:
-                  t += '\ndependencies {\n    ' + dep + '\n}\n'
+                  t += "\ndependencies {\n    " + dep + "\n}\n"
 
           g.write_text(t)
-          print('Patched app gradle:', g)
-          print('  compileSdk/targetSdk/minSdk ->', compile_sdk, target_sdk, min_sdk)
+          print("Patched app gradle:", g)
+          print("  compileSdk/targetSdk/minSdk ->", compile_sdk, target_sdk, min_sdk)
 
           # Force compileSdk on every Android subproject (file_picker, etc.)
-          marker = 'forceCompileSdkForPlugins'
-          root_kts = root / 'build.gradle.kts'
-          root_groovy = root / 'build.gradle'
+          marker = "forceCompileSdkForPlugins"
+          root_kts = root / "build.gradle.kts"
+          root_groovy = root / "build.gradle"
 
-          # Build snippet with textwrap so YAML never sees unindented braces
           if root_kts.exists():
               rb = root_kts
-              snippet = textwrap.dedent("""
+              snippet = textwrap.dedent(
+                  """
                   // forceCompileSdkForPlugins
                   subprojects {
                       afterEvaluate {
@@ -220,10 +217,12 @@ jobs:
                           } catch (_: Throwable) {}
                       }
                   }
-                  """).replace("__SDK__", compile_sdk)
+                  """
+              ).replace("__SDK__", compile_sdk)
           else:
               rb = root_groovy
-              snippet = textwrap.dedent("""
+              snippet = textwrap.dedent(
+                  """
                   // forceCompileSdkForPlugins
                   subprojects { subproject ->
                       subproject.afterEvaluate {
@@ -237,41 +236,41 @@ jobs:
                           }
                       }
                   }
-                  """).replace("__SDK__", compile_sdk)
+                  """
+              ).replace("__SDK__", compile_sdk)
 
-          existing = rb.read_text() if rb.exists() else ''
+          existing = rb.read_text() if rb.exists() else ""
           if marker not in existing:
               rb.write_text(existing.rstrip() + "\n" + snippet)
-              print('Forced compileSdk on all subprojects via', rb)
+              print("Forced compileSdk on all subprojects via", rb)
           else:
-              print('Subproject compileSdk force already present in', rb)
+              print("Subproject compileSdk force already present in", rb)
 
-          proguard = root / 'app/proguard-rules.pro'
-          proguard.write_text(
-              '-keep class com.dexterous.** { *; }\n'
-              '-keep class io.flutter.** { *; }\n'
-              '-keep class com.google.gson.** { *; }\n'
-              '-dontwarn com.google.android.play.core.**\n'
+          (root / "app/proguard-rules.pro").write_text(
+              "-keep class com.dexterous.** { *; }\n"
+              "-keep class io.flutter.** { *; }\n"
+              "-keep class com.google.gson.** { *; }\n"
+              "-dontwarn com.google.android.play.core.**\n"
           )
 
-          gp = root / 'gradle.properties'
+          gp = root / "gradle.properties"
           extra_lines = [
-              'org.gradle.caching=true',
-              'org.gradle.parallel=true',
-              'android.useAndroidX=true',
-              'android.nonTransitiveRClass=true',
+              "org.gradle.caching=true",
+              "org.gradle.parallel=true",
+              "android.useAndroidX=true",
+              "android.nonTransitiveRClass=true",
           ]
-          existing = gp.read_text() if gp.exists() else ''
+          existing = gp.read_text() if gp.exists() else ""
           for line in extra_lines:
               if line not in existing:
-                  existing += '\n' + line
-          gp.write_text(existing.rstrip() + '\n')
+                  existing += "\n" + line
+          gp.write_text(existing.rstrip() + "\n")
 
-          print('--- app gradle SDK lines ---')
+          print("--- app gradle SDK lines ---")
           for line in g.read_text().splitlines():
-              if any(k in line for k in ('compileSdk', 'targetSdk', 'minSdk', 'compileOptions', 'desugar')):
+              if any(k in line for k in ("compileSdk", "targetSdk", "minSdk", "compileOptions", "desugar")):
                   print(line)
-          print('Android project patched successfully.')
+          print("Android project patched successfully.")
           PY
 
       - name: Get packages
