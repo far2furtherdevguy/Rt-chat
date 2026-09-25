@@ -143,30 +143,31 @@ jobs:
           t = g.read_text()
 
           # Force modern SDK levels so plugins that require compileSdk >= 36 succeed.
-          # Handles both "compileSdk = flutter.compileSdkVersion" and "compileSdkVersion flutter.compileSdkVersion".
-          def force_sdk(text, names, value):
-              for name in names:
-                  # Kotlin DSL: compileSdk = ...
-                  text = re.sub(
-                      rf'{name}\s*=\s*[^\n]+',
-                      f'{name} = {value}',
-                      text,
-                      count=1,
-                  )
-                  # Groovy: compileSdkVersion ...
-                  text = re.sub(
-                      rf'{name}\s+[^\n]+',
-                      f'{name} {value}',
-                      text,
-                      count=1,
-                  )
+          # Kotlin DSL needs "compileSdk = 36"; Groovy needs "compileSdkVersion 36".
+          # Never apply the Groovy form on a .kts file (that produces "compileSdk 36" and breaks the build).
+          def force_sdk(text, prop, version_prop, value):
+              if kts:
+                  # Match "compileSdk = ..." or "compileSdkVersion = ..."
+                  if re.search(rf'(?m)^\s*{prop}\s*=', text):
+                      text = re.sub(rf'(?m)^(\s*){prop}\s*=\s*[^\n]+', rf'\1{prop} = {value}', text, count=1)
+                  elif re.search(rf'(?m)^\s*{version_prop}\s*=', text):
+                      text = re.sub(rf'(?m)^(\s*){version_prop}\s*=\s*[^\n]+', rf'\1{prop} = {value}', text, count=1)
+                  else:
+                      text = re.sub(r'(android\s*\{)', rf'\1\n    {prop} = {value}', text, count=1)
+              else:
+                  if re.search(rf'(?m)^\s*{version_prop}\s+', text):
+                      text = re.sub(rf'(?m)^(\s*){version_prop}\s+[^\n]+', rf'\1{version_prop} {value}', text, count=1)
+                  elif re.search(rf'(?m)^\s*{prop}\s+', text):
+                      text = re.sub(rf'(?m)^(\s*){prop}\s+[^\n]+', rf'\1{prop} {value}', text, count=1)
+                  else:
+                      text = re.sub(r'(android\s*\{)', rf'\1\n    {version_prop} {value}', text, count=1)
               return text
 
-          t = force_sdk(t, ('compileSdk', 'compileSdkVersion'), compile_sdk)
-          t = force_sdk(t, ('targetSdk', 'targetSdkVersion'), target_sdk)
-          t = force_sdk(t, ('minSdk', 'minSdkVersion'), min_sdk)
+          t = force_sdk(t, 'compileSdk', 'compileSdkVersion', compile_sdk)
+          t = force_sdk(t, 'targetSdk', 'targetSdkVersion', target_sdk)
+          t = force_sdk(t, 'minSdk', 'minSdkVersion', min_sdk)
 
-          # Also replace any remaining flutter.*SdkVersion placeholders
+          # Safety net: replace any leftover flutter.*SdkVersion tokens still present as values
           t = re.sub(r'flutter\.compileSdkVersion', compile_sdk, t)
           t = re.sub(r'flutter\.targetSdkVersion', target_sdk, t)
           t = re.sub(r'flutter\.minSdkVersion', min_sdk, t)
