@@ -117,7 +117,7 @@ jobs:
           target_sdk = os.environ.get('ANDROID_TARGET_SDK', '36')
           min_sdk = os.environ.get('ANDROID_MIN_SDK', '23')
 
-          # Manifest: app name + permissions
+          # ── Manifest: app name + permissions ──
           mf = root / 'app/src/main/AndroidManifest.xml'
           s = mf.read_text()
           s = re.sub(r'android:label="[^"]*"', 'android:label="RT Chat"', s, count=1)
@@ -130,7 +130,7 @@ jobs:
           s = s.replace('<application', add + '    <application', 1)
           mf.write_text(s)
 
-          # app-level gradle (Kotlin DSL or Groovy)
+          # ── app-level gradle (Kotlin DSL or Groovy) ──
           g = None
           for name in ('build.gradle.kts', 'build.gradle'):
               cand = root / 'app' / name
@@ -142,12 +142,8 @@ jobs:
           kts = g.name.endswith('.kts')
           t = g.read_text()
 
-          # Force modern SDK levels so plugins that require compileSdk >= 36 succeed.
-          # Kotlin DSL needs "compileSdk = 36"; Groovy needs "compileSdkVersion 36".
-          # Never apply the Groovy form on a .kts file (that produces "compileSdk 36" and breaks the build).
           def force_sdk(text, prop, version_prop, value):
               if kts:
-                  # Match "compileSdk = ..." or "compileSdkVersion = ..."
                   if re.search(rf'(?m)^\s*{prop}\s*=', text):
                       text = re.sub(rf'(?m)^(\s*){prop}\s*=\s*[^\n]+', rf'\1{prop} = {value}', text, count=1)
                   elif re.search(rf'(?m)^\s*{version_prop}\s*=', text):
@@ -166,19 +162,15 @@ jobs:
           t = force_sdk(t, 'compileSdk', 'compileSdkVersion', compile_sdk)
           t = force_sdk(t, 'targetSdk', 'targetSdkVersion', target_sdk)
           t = force_sdk(t, 'minSdk', 'minSdkVersion', min_sdk)
-
-          # Safety net: replace any leftover flutter.*SdkVersion tokens still present as values
           t = re.sub(r'flutter\.compileSdkVersion', compile_sdk, t)
           t = re.sub(r'flutter\.targetSdkVersion', target_sdk, t)
           t = re.sub(r'flutter\.minSdkVersion', min_sdk, t)
 
-          # Core library desugaring (needed by several plugins on lower minSdk)
           if 'coreLibraryDesugaring' not in t and 'isCoreLibraryDesugaringEnabled' not in t:
               flag = 'isCoreLibraryDesugaringEnabled = true' if kts else 'coreLibraryDesugaringEnabled true'
               if re.search(r'compileOptions\s*\{', t):
                   t = re.sub(r'compileOptions\s*\{', lambda m: m.group(0) + '\n        ' + flag, t, count=1)
               else:
-                  # inject a compileOptions block if missing
                   inject = (
                       f'\n    compileOptions {{\n        {flag}\n'
                       f'        sourceCompatibility = JavaVersion.VERSION_17\n'
@@ -189,7 +181,6 @@ jobs:
                       f'        targetCompatibility JavaVersion.VERSION_17\n    }}\n'
                   )
                   t = re.sub(r'(android\s*\{)', r'\1' + inject, t, count=1)
-
               dep = (
                   'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")'
                   if kts else
@@ -204,7 +195,60 @@ jobs:
           print('Patched app gradle:', g)
           print('  compileSdk/targetSdk/minSdk ->', compile_sdk, target_sdk, min_sdk)
 
-          # Keep R8 from stripping notification / plugin classes in release builds
+          # ── Force compileSdk on EVERY Android subproject (file_picker, etc.) ──
+          # App-level compileSdk alone is not enough: plugins keep their own
+          # android { compileSdk 34 } and CheckAarMetadata then fails.
+          marker = 'forceCompileSdkForPlugins'
+          root_kts = root / 'build.gradle.kts'
+          root_groovy = root / 'build.gradle'
+
+          if root_kts.exists():
+              rb = root_kts
+              snippet = """
+
+// forceCompileSdkForPlugins: bump plugin compileSdk so AAR metadata checks pass
+subprojects {
+    afterEvaluate {
+        val ext = extensions.findByName("android") ?: return@afterEvaluate
+        try {
+            ext.javaClass.methods
+                .find { it.name == "setCompileSdkVersion" && it.parameterCount == 1 }
+                ?.invoke(ext, COMPILE_SDK_PLACEHOLDER)
+        } catch (_: Throwable) {}
+        try {
+            ext.javaClass.methods
+                .find { it.name == "setCompileSdk" && it.parameterCount == 1 }
+                ?.invoke(ext, COMPILE_SDK_PLACEHOLDER)
+        } catch (_: Throwable) {}
+    }
+}
+""".replace('COMPILE_SDK_PLACEHOLDER', compile_sdk)
+          else:
+              rb = root_groovy
+              snippet = """
+
+// forceCompileSdkForPlugins: bump plugin compileSdk so AAR metadata checks pass
+subprojects { subproject ->
+    subproject.afterEvaluate {
+        if (subproject.plugins.hasPlugin("com.android.library") ||
+            subproject.plugins.hasPlugin("com.android.application")) {
+            def androidExt = subproject.extensions.findByName("android")
+            if (androidExt != null) {
+                try { androidExt.compileSdkVersion = COMPILE_SDK_PLACEHOLDER } catch (Throwable ignored) {}
+                try { androidExt.compileSdk = COMPILE_SDK_PLACEHOLDER } catch (Throwable ignored) {}
+            }
+        }
+    }
+}
+""".replace('COMPILE_SDK_PLACEHOLDER', compile_sdk)
+
+          existing = rb.read_text() if rb.exists() else ''
+          if marker not in existing:
+              rb.write_text(existing.rstrip() + snippet)
+              print('Forced compileSdk on all subprojects via', rb)
+          else:
+              print('Subproject compileSdk force already present in', rb)
+
           (root / 'app/proguard-rules.pro').write_text(
               '-keep class com.dexterous.** { *; }\n'
               '-keep class io.flutter.** { *; }\n'
@@ -212,7 +256,6 @@ jobs:
               '-dontwarn com.google.android.play.core.**\n'
           )
 
-          # Gradle performance / caching + AndroidX
           gp = root / 'gradle.properties'
           extra = (
               '\norg.gradle.caching=true\n'
@@ -225,6 +268,11 @@ jobs:
               if line and line not in existing:
                   existing += '\n' + line
           gp.write_text(existing.rstrip() + '\n')
+
+          print('--- app gradle SDK lines ---')
+          for line in g.read_text().splitlines():
+              if any(k in line for k in ('compileSdk', 'targetSdk', 'minSdk', 'compileOptions', 'desugar')):
+                  print(line)
           print('Android project patched successfully.')
           PY
 
