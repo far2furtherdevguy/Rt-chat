@@ -203,8 +203,8 @@ jobs:
                   """
                   // forceCompileSdkForPlugins
                   subprojects {
-                      afterEvaluate {
-                          val ext = extensions.findByName("android") ?: return@afterEvaluate
+                      fun Project.forceSdk() {
+                          val ext = extensions.findByName("android") ?: return
                           try {
                               ext.javaClass.methods
                                   .find { it.name == "setCompileSdkVersion" && it.parameterCount == 1 }
@@ -216,6 +216,12 @@ jobs:
                                   ?.invoke(ext, __SDK__)
                           } catch (_: Throwable) {}
                       }
+                      // Safe: afterEvaluate fails if the project is already evaluated
+                      if (state.executed) {
+                          forceSdk()
+                      } else {
+                          afterEvaluate { forceSdk() }
+                      }
                   }
                   """
               ).replace("__SDK__", compile_sdk)
@@ -225,7 +231,7 @@ jobs:
                   """
                   // forceCompileSdkForPlugins
                   subprojects { subproject ->
-                      subproject.afterEvaluate {
+                      def forceSdk = {
                           if (subproject.plugins.hasPlugin("com.android.library") ||
                               subproject.plugins.hasPlugin("com.android.application")) {
                               def androidExt = subproject.extensions.findByName("android")
@@ -234,6 +240,11 @@ jobs:
                                   try { androidExt.compileSdk = __SDK__ } catch (Throwable ignored) {}
                               }
                           }
+                      }
+                      if (subproject.state.executed) {
+                          forceSdk()
+                      } else {
+                          subproject.afterEvaluate { forceSdk() }
                       }
                   }
                   """
