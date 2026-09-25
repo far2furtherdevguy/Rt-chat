@@ -1388,22 +1388,47 @@ class _LoginState extends State<LoginScreen> {
       err = null;
     });
     try {
-      final gs = GoogleSignIn(scopes: const ['email'], serverClientId: Cfg.webClientId.isEmpty ? null : Cfg.webClientId);
+      if (Cfg.webClientId.isEmpty) {
+        throw StateError('GOOGLE_WEB_CLIENT_ID is missing from this build.');
+      }
+      final gs = GoogleSignIn(scopes: const ['email'], serverClientId: Cfg.webClientId);
       final acc = await gs.signIn();
       if (acc == null) {
+        // User dismissed the account picker — not an error.
         if (mounted) setState(() => busy = false);
         return;
       }
       final a = await acc.authentication;
-      await fb.FirebaseAuth.instance
-          .signInWithCredential(fb.GoogleAuthProvider.credential(idToken: a.idToken, accessToken: a.accessToken));
+      // Null idToken almost always means the APK's SHA-1 is not registered in Firebase,
+      // or GOOGLE_WEB_CLIENT_ID is not the Web client ID from the Google provider page.
+      if (a.idToken == null || a.idToken!.isEmpty) {
+        throw StateError('no_id_token');
+      }
+      await fb.FirebaseAuth.instance.signInWithCredential(
+        fb.GoogleAuthProvider.credential(idToken: a.idToken, accessToken: a.accessToken),
+      );
     } catch (e) {
       DLog.d('auth', '$e');
-      var m = 'Sign-in failed. Check your connection and try again.';
-      if ('$e'.contains('ApiException: 10') || '$e'.contains('DEVELOPER_ERROR')) {
-        m = 'This build is not authorised yet. Add its SHA-1 fingerprint to your Firebase Android app (see README).';
-      } else if ('$e'.contains('network')) {
+      final s = '$e';
+      String m;
+      if (s.contains('no_id_token') ||
+          s.contains('ApiException: 10') ||
+          s.contains('DEVELOPER_ERROR') ||
+          s.contains('ApiException: 12500')) {
+        m = 'This APK is not authorised in Firebase yet.\n\n'
+            '1. Open the GitHub Actions build → Summary\n'
+            '2. Copy the SHA-1 fingerprint\n'
+            '3. Firebase Console → Project settings → Your Android app (com.rtchat.rt_chat) → Add fingerprint\n'
+            '4. Also confirm GOOGLE_WEB_CLIENT_ID is the Web client ID from Authentication → Google';
+      } else if (s.contains('GOOGLE_WEB_CLIENT_ID is missing')) {
+        m = 'This build has no GOOGLE_WEB_CLIENT_ID. Add that secret and rebuild.';
+      } else if (s.toLowerCase().contains('network') || s.contains('SocketException') || s.contains('FirebaseNetwork')) {
         m = 'No internet connection.';
+      } else if (s.contains('ApiException: 7')) {
+        m = 'Network error talking to Google. Check your connection.';
+      } else {
+        final short = s.length > 120 ? '${s.substring(0, 120)}…' : s;
+        m = 'Sign-in failed.\n$short';
       }
       if (mounted) {
         setState(() {
@@ -1411,12 +1436,19 @@ class _LoginState extends State<LoginScreen> {
           err = m;
         });
       }
+      return;
     }
+    if (mounted) setState(() => busy = false);
   }
 
   @override
   Widget build(BuildContext context) {
     final acc = accents[Prefs.accent];
+    // Non-secret diagnostics: shows whether dart-defines were baked into this APK.
+    final cfgHint =
+        'cfg: project=${Cfg.fbProject.isEmpty ? "MISSING" : Cfg.fbProject}  '
+        'webClient=${Cfg.webClientId.isEmpty ? "MISSING" : "ok(${Cfg.webClientId.length} chars)"}  '
+        'appId=${Cfg.fbAppId.isEmpty ? "MISSING" : "ok"}';
     return Scaffold(
       body: SafeArea(
         child: Padding(
@@ -1439,7 +1471,13 @@ class _LoginState extends State<LoginScreen> {
                 label: const Text('Continue with Google'),
               ),
             ),
-            if (err != null) Padding(padding: const EdgeInsets.only(top: 16), child: Text(err!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.redAccent))),
+            if (err != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 16),
+                child: SelectableText(err!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.redAccent, fontSize: 13)),
+              ),
+            const SizedBox(height: 24),
+            SelectableText(cfgHint, textAlign: TextAlign.center, style: TextStyle(fontSize: 11, color: Colors.grey.shade600, fontFamily: 'monospace')),
           ]),
         ),
       ),
