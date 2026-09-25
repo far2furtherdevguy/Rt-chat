@@ -26,6 +26,10 @@ jobs:
       GOOGLE_WEB_CLIENT_ID: ${{ secrets.GOOGLE_WEB_CLIENT_ID }}
       GIPHY_API_KEY: ${{ secrets.GIPHY_API_KEY }}
       MAX_UPLOAD_MB: ${{ vars.MAX_UPLOAD_MB || '25' }}
+      # Keep these in sync with the values forced in the Android patch step below.
+      ANDROID_COMPILE_SDK: '35'
+      ANDROID_TARGET_SDK: '35'
+      ANDROID_MIN_SDK: '23'
 
     steps:
       - name: Checkout
@@ -104,17 +108,24 @@ jobs:
           mkdir -p android/app/src/main
           ls android
 
-      - name: Patch Android project (label, permissions, minSdk, desugaring)
+      - name: Patch Android project (label, permissions, SDK levels, desugaring)
         run: |
           python3 - <<'PY'
-          import re, pathlib
+          import os, re, pathlib
           root = pathlib.Path('android')
+          compile_sdk = os.environ.get('ANDROID_COMPILE_SDK', '35')
+          target_sdk = os.environ.get('ANDROID_TARGET_SDK', '35')
+          min_sdk = os.environ.get('ANDROID_MIN_SDK', '23')
 
           # Manifest: app name + permissions
           mf = root / 'app/src/main/AndroidManifest.xml'
           s = mf.read_text()
           s = re.sub(r'android:label="[^"]*"', 'android:label="RT Chat"', s, count=1)
-          perms = ['android.permission.INTERNET', 'android.permission.POST_NOTIFICATIONS', 'android.permission.VIBRATE']
+          perms = [
+              'android.permission.INTERNET',
+              'android.permission.POST_NOTIFICATIONS',
+              'android.permission.VIBRATE',
+          ]
           add = ''.join('    <uses-permission android:name="%s"/>\n' % p for p in perms if p not in s)
           s = s.replace('<application', add + '    <application', 1)
           mf.write_text(s)
@@ -130,30 +141,90 @@ jobs:
               raise SystemExit('android/app/build.gradle(.kts) not found')
           kts = g.name.endswith('.kts')
           t = g.read_text()
-          t = re.sub(r'minSdk(Version)?(\s*=\s*|\s+)flutter\.minSdkVersion',
-                     lambda m: 'minSdk%s%s23' % (m.group(1) or '', m.group(2)), t)
-          t = re.sub(r'compileSdk(Version)?(\s*=\s*|\s+)flutter\.compileSdkVersion',
-                     lambda m: 'compileSdk%s%s36' % (m.group(1) or '', m.group(2)), t)
-          if 'oreLibraryDesugaring' not in t:
+
+          # Force modern SDK levels so plugins that require compileSdk >= 34/35 succeed.
+          # Handles both "compileSdk = flutter.compileSdkVersion" and "compileSdkVersion flutter.compileSdkVersion".
+          def force_sdk(text, names, value):
+              for name in names:
+                  # Kotlin DSL: compileSdk = ...
+                  text = re.sub(
+                      rf'{name}\s*=\s*[^\n]+',
+                      f'{name} = {value}',
+                      text,
+                      count=1,
+                  )
+                  # Groovy: compileSdkVersion ...
+                  text = re.sub(
+                      rf'{name}\s+[^\n]+',
+                      f'{name} {value}',
+                      text,
+                      count=1,
+                  )
+              return text
+
+          t = force_sdk(t, ('compileSdk', 'compileSdkVersion'), compile_sdk)
+          t = force_sdk(t, ('targetSdk', 'targetSdkVersion'), target_sdk)
+          t = force_sdk(t, ('minSdk', 'minSdkVersion'), min_sdk)
+
+          # Also replace any remaining flutter.*SdkVersion placeholders
+          t = re.sub(r'flutter\.compileSdkVersion', compile_sdk, t)
+          t = re.sub(r'flutter\.targetSdkVersion', target_sdk, t)
+          t = re.sub(r'flutter\.minSdkVersion', min_sdk, t)
+
+          # Core library desugaring (needed by several plugins on lower minSdk)
+          if 'coreLibraryDesugaring' not in t and 'isCoreLibraryDesugaringEnabled' not in t:
               flag = 'isCoreLibraryDesugaringEnabled = true' if kts else 'coreLibraryDesugaringEnabled true'
-              t = re.sub(r'compileOptions\s*\{', lambda m: m.group(0) + '\n        ' + flag, t, count=1)
-              dep = ('coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")' if kts
-                     else "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'")
-              t += '\ndependencies {\n    ' + dep + '\n}\n'
+              if re.search(r'compileOptions\s*\{', t):
+                  t = re.sub(r'compileOptions\s*\{', lambda m: m.group(0) + '\n        ' + flag, t, count=1)
+              else:
+                  # inject a compileOptions block if missing
+                  inject = (
+                      f'\n    compileOptions {{\n        {flag}\n'
+                      f'        sourceCompatibility = JavaVersion.VERSION_17\n'
+                      f'        targetCompatibility = JavaVersion.VERSION_17\n    }}\n'
+                      if kts else
+                      f'\n    compileOptions {{\n        {flag}\n'
+                      f'        sourceCompatibility JavaVersion.VERSION_17\n'
+                      f'        targetCompatibility JavaVersion.VERSION_17\n    }}\n'
+                  )
+                  t = re.sub(r'(android\s*\{)', r'\1' + inject, t, count=1)
+
+              dep = (
+                  'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")'
+                  if kts else
+                  "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'"
+              )
+              if re.search(r'dependencies\s*\{', t):
+                  t = re.sub(r'dependencies\s*\{', lambda m: m.group(0) + '\n    ' + dep, t, count=1)
+              else:
+                  t += '\ndependencies {\n    ' + dep + '\n}\n'
+
           g.write_text(t)
+          print('Patched app gradle:', g)
+          print('  compileSdk/targetSdk/minSdk ->', compile_sdk, target_sdk, min_sdk)
 
           # Keep R8 from stripping notification / plugin classes in release builds
           (root / 'app/proguard-rules.pro').write_text(
               '-keep class com.dexterous.** { *; }\n'
               '-keep class io.flutter.** { *; }\n'
               '-keep class com.google.gson.** { *; }\n'
-              '-dontwarn com.google.android.play.core.**\n')
+              '-dontwarn com.google.android.play.core.**\n'
+          )
 
-          # Gradle performance / caching
+          # Gradle performance / caching + AndroidX
           gp = root / 'gradle.properties'
-          extra = '\norg.gradle.caching=true\norg.gradle.parallel=true\nandroid.useAndroidX=true\n'
-          gp.write_text((gp.read_text() if gp.exists() else '') + extra)
-          print('Android project patched:', g)
+          extra = (
+              '\norg.gradle.caching=true\n'
+              'org.gradle.parallel=true\n'
+              'android.useAndroidX=true\n'
+              'android.nonTransitiveRClass=true\n'
+          )
+          existing = gp.read_text() if gp.exists() else ''
+          for line in extra.strip().splitlines():
+              if line and line not in existing:
+                  existing += '\n' + line
+          gp.write_text(existing.rstrip() + '\n')
+          print('Android project patched successfully.')
           PY
 
       - name: Get packages
