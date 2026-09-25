@@ -27,8 +27,8 @@ jobs:
       GIPHY_API_KEY: ${{ secrets.GIPHY_API_KEY }}
       MAX_UPLOAD_MB: ${{ vars.MAX_UPLOAD_MB || '25' }}
       # Keep these in sync with the values forced in the Android patch step below.
-      ANDROID_COMPILE_SDK: '35'
-      ANDROID_TARGET_SDK: '35'
+      ANDROID_COMPILE_SDK: '36'
+      ANDROID_TARGET_SDK: '36'
       ANDROID_MIN_SDK: '23'
 
     steps:
@@ -113,8 +113,8 @@ jobs:
           python3 - <<'PY'
           import os, re, pathlib
           root = pathlib.Path('android')
-          compile_sdk = os.environ.get('ANDROID_COMPILE_SDK', '35')
-          target_sdk = os.environ.get('ANDROID_TARGET_SDK', '35')
+          compile_sdk = os.environ.get('ANDROID_COMPILE_SDK', '36')
+          target_sdk = os.environ.get('ANDROID_TARGET_SDK', '36')
           min_sdk = os.environ.get('ANDROID_MIN_SDK', '23')
 
           # Manifest: app name + permissions
@@ -142,7 +142,7 @@ jobs:
           kts = g.name.endswith('.kts')
           t = g.read_text()
 
-          # Force modern SDK levels so plugins that require compileSdk >= 34/35 succeed.
+          # Force modern SDK levels so plugins that require compileSdk >= 36 succeed.
           # Handles both "compileSdk = flutter.compileSdkVersion" and "compileSdkVersion flutter.compileSdkVersion".
           def force_sdk(text, names, value):
               for name in names:
