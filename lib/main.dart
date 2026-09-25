@@ -47,8 +47,51 @@ class Cfg {
   static const debugPassword = 'pass'; // dev debug log lock (not shown to users)
   static const editWindow = Duration(minutes: 15);
   static const deleteWindow = Duration(hours: 48);
-  static bool get configured =>
-      [supabaseUrl, supabaseAnon, fbApiKey, fbAppId, fbProject, fbSender].every((e) => e.isNotEmpty);
+  /// Supabase is required. Firebase is optional (Google sign-in not required).
+  static bool get configured => supabaseUrl.isNotEmpty && supabaseAnon.isNotEmpty;
+  static bool get firebaseConfigured =>
+      [fbApiKey, fbAppId, fbProject, fbSender].every((e) => e.isNotEmpty);
+}
+
+// ───────────────────────── Local identity (no Google required) ─────────────────────────
+/// Stable per-install user id. Name/username live on Supabase as the profile.
+class LocalAuth {
+  static const _key = 'rt_local_uid';
+  static const FlutterSecureStorage _store = FlutterSecureStorage();
+  static final Uuid _uuid = Uuid();
+
+  static Future<String?> readUid() async {
+    try {
+      final v = await _store.read(key: _key);
+      if (v != null && v.isNotEmpty) return v;
+    } catch (e) {
+      DLog.d('auth', 'secure read uid failed: $e');
+    }
+    return Prefs.sp.getString(_key);
+  }
+
+  static Future<String> ensureUid() async {
+    final existing = await readUid();
+    if (existing != null) return existing;
+    final id = _uuid.v4();
+    try {
+      await _store.write(key: _key, value: id);
+    } catch (e) {
+      DLog.d('auth', 'secure write uid failed: $e');
+    }
+    await Prefs.sp.setString(_key, id);
+    return id;
+  }
+
+  static Future<void> clear() async {
+    try {
+      await _store.delete(key: _key);
+    } catch (_) {}
+    await Prefs.sp.remove(_key);
+  }
+
+  /// Bumped on sign-out so AuthGate reloads identity.
+  static final ValueNotifier<int> rev = ValueNotifier<int>(0);
 }
 
 // ───────────────────────── Debug log (hidden, password locked) ─────────────────────────
@@ -566,8 +609,8 @@ class Svc {
 
   // ── session ──
   /// Returns true when the user still has to create a profile (username).
-  static Future<bool> start(fb.User u) async {
-    me = u.uid;
+  static Future<bool> start(String uid) async {
+    me = uid;
     await Db.open(me);
     await Crypt.init(me);
     try {
@@ -1184,11 +1227,14 @@ void onNotif(NotificationResponse r) {
 class Boot {
   static Future<void> init() async {
     if (!Cfg.configured) return;
-    try {
-      await Firebase.initializeApp(
-          options: FirebaseOptions(apiKey: Cfg.fbApiKey, appId: Cfg.fbAppId, messagingSenderId: Cfg.fbSender, projectId: Cfg.fbProject));
-    } catch (e) {
-      DLog.d('boot', 'firebase: $e');
+    // Firebase is optional; local identity does not need it.
+    if (Cfg.firebaseConfigured) {
+      try {
+        await Firebase.initializeApp(
+            options: FirebaseOptions(apiKey: Cfg.fbApiKey, appId: Cfg.fbAppId, messagingSenderId: Cfg.fbSender, projectId: Cfg.fbProject));
+      } catch (e) {
+        DLog.d('boot', 'firebase: $e');
+      }
     }
     await Supabase.initialize(url: Cfg.supabaseUrl, anonKey: Cfg.supabaseAnon);
     await Notif.init(onNotif);
@@ -1262,7 +1308,7 @@ class _RtAppState extends State<RtApp> {
             if (!Cfg.configured) {
               return const InfoScreen(
                   title: 'Setup needed',
-                  text: 'This build has no Firebase/Supabase keys. Add the GitHub secrets listed in README.md and run the workflow again.');
+                  text: 'This build has no Supabase keys. Add SUPABASE_URL and SUPABASE_ANON_KEY as GitHub secrets and run the workflow again.');
             }
             return const AuthGate();
           },
@@ -1312,10 +1358,14 @@ class InfoScreen extends StatelessWidget {
 
 Future<void> signOut() async {
   await Svc.stop();
+  await LocalAuth.clear();
+  try {
+    if (Cfg.firebaseConfigured) await fb.FirebaseAuth.instance.signOut();
+  } catch (_) {}
   try {
     await GoogleSignIn().signOut();
   } catch (_) {}
-  await fb.FirebaseAuth.instance.signOut();
+  LocalAuth.rev.value++;
 }
 
 Future<String?> askText(BuildContext c, String title, {String hint = '', String initial = '', int maxLen = 60, bool obscure = false}) {
@@ -1357,143 +1407,59 @@ class Avatar extends StatelessWidget {
   }
 }
 
-// ───────────────────────── Auth ─────────────────────────
-class AuthGate extends StatelessWidget {
+// ───────────────────────── Auth (local identity — no Google) ─────────────────────────
+class AuthGate extends StatefulWidget {
   const AuthGate({super.key});
   @override
-  Widget build(BuildContext context) => StreamBuilder<fb.User?>(
-        stream: fb.FirebaseAuth.instance.authStateChanges(),
+  State<AuthGate> createState() => _AuthGateState();
+}
+
+class _AuthGateState extends State<AuthGate> {
+  late Future<String> _uid = LocalAuth.ensureUid();
+
+  @override
+  void initState() {
+    super.initState();
+    LocalAuth.rev.addListener(_reload);
+  }
+
+  @override
+  void dispose() {
+    LocalAuth.rev.removeListener(_reload);
+    super.dispose();
+  }
+
+  void _reload() {
+    if (!mounted) return;
+    setState(() => _uid = LocalAuth.ensureUid());
+  }
+
+  @override
+  Widget build(BuildContext context) => FutureBuilder<String>(
+        future: _uid,
         builder: (c, s) {
-          if (s.connectionState == ConnectionState.waiting) return const Splash();
-          final u = s.data;
-          if (u == null) return const LoginScreen();
-          return SessionGate(key: ValueKey(u.uid), user: u);
+          if (s.connectionState != ConnectionState.done) return const Splash();
+          if (s.hasError || s.data == null) {
+            return InfoScreen(
+              title: 'Could not start',
+              text: '${s.error ?? "Unknown error"}',
+              onRetry: () => setState(() => _uid = LocalAuth.ensureUid()),
+            );
+          }
+          return SessionGate(key: ValueKey('${s.data}-${LocalAuth.rev.value}'), uid: s.data!);
         },
       );
 }
 
-class LoginScreen extends StatefulWidget {
-  const LoginScreen({super.key});
-  @override
-  State<LoginScreen> createState() => _LoginState();
-}
-
-class _LoginState extends State<LoginScreen> {
-  bool busy = false;
-  String? err;
-
-  Future<void> _go() async {
-    setState(() {
-      busy = true;
-      err = null;
-    });
-    try {
-      if (Cfg.webClientId.isEmpty) {
-        throw StateError('GOOGLE_WEB_CLIENT_ID is missing from this build.');
-      }
-      final gs = GoogleSignIn(scopes: const ['email'], serverClientId: Cfg.webClientId);
-      final acc = await gs.signIn();
-      if (acc == null) {
-        // User dismissed the account picker — not an error.
-        if (mounted) setState(() => busy = false);
-        return;
-      }
-      final a = await acc.authentication;
-      // Null idToken almost always means the APK's SHA-1 is not registered in Firebase,
-      // or GOOGLE_WEB_CLIENT_ID is not the Web client ID from the Google provider page.
-      if (a.idToken == null || a.idToken!.isEmpty) {
-        throw StateError('no_id_token');
-      }
-      await fb.FirebaseAuth.instance.signInWithCredential(
-        fb.GoogleAuthProvider.credential(idToken: a.idToken, accessToken: a.accessToken),
-      );
-    } catch (e) {
-      DLog.d('auth', '$e');
-      final s = '$e';
-      String m;
-      if (s.contains('no_id_token') ||
-          s.contains('ApiException: 10') ||
-          s.contains('DEVELOPER_ERROR') ||
-          s.contains('ApiException: 12500')) {
-        m = 'This APK is not authorised in Firebase yet.\n\n'
-            '1. Open the GitHub Actions build → Summary\n'
-            '2. Copy the SHA-1 fingerprint\n'
-            '3. Firebase Console → Project settings → Your Android app (com.rtchat.rt_chat) → Add fingerprint\n'
-            '4. Also confirm GOOGLE_WEB_CLIENT_ID is the Web client ID from Authentication → Google';
-      } else if (s.contains('GOOGLE_WEB_CLIENT_ID is missing')) {
-        m = 'This build has no GOOGLE_WEB_CLIENT_ID. Add that secret and rebuild.';
-      } else if (s.toLowerCase().contains('network') || s.contains('SocketException') || s.contains('FirebaseNetwork')) {
-        m = 'No internet connection.';
-      } else if (s.contains('ApiException: 7')) {
-        m = 'Network error talking to Google. Check your connection.';
-      } else {
-        final short = s.length > 120 ? '${s.substring(0, 120)}…' : s;
-        m = 'Sign-in failed.\n$short';
-      }
-      if (mounted) {
-        setState(() {
-          busy = false;
-          err = m;
-        });
-      }
-      return;
-    }
-    if (mounted) setState(() => busy = false);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final acc = accents[Prefs.accent];
-    // Non-secret diagnostics: shows whether dart-defines were baked into this APK.
-    final cfgHint =
-        'cfg: project=${Cfg.fbProject.isEmpty ? "MISSING" : Cfg.fbProject}  '
-        'webClient=${Cfg.webClientId.isEmpty ? "MISSING" : "ok(${Cfg.webClientId.length} chars)"}  '
-        'appId=${Cfg.fbAppId.isEmpty ? "MISSING" : "ok"}';
-    return Scaffold(
-      body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(32),
-          child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-            Icon(Icons.chat_bubble, size: 84, color: acc),
-            const SizedBox(height: 16),
-            const Text(Cfg.appName, style: TextStyle(fontSize: 32, fontWeight: FontWeight.w800)),
-            const SizedBox(height: 8),
-            const Text('Simple, fast, private messaging.', textAlign: TextAlign.center),
-            const SizedBox(height: 40),
-            SizedBox(
-              width: double.infinity,
-              height: 52,
-              child: FilledButton.icon(
-                onPressed: busy ? null : _go,
-                icon: busy
-                    ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                    : const Icon(Icons.login),
-                label: const Text('Continue with Google'),
-              ),
-            ),
-            if (err != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 16),
-                child: SelectableText(err!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.redAccent, fontSize: 13)),
-              ),
-            const SizedBox(height: 24),
-            SelectableText(cfgHint, textAlign: TextAlign.center, style: TextStyle(fontSize: 11, color: Colors.grey.shade600, fontFamily: 'monospace')),
-          ]),
-        ),
-      ),
-    );
-  }
-}
-
 class SessionGate extends StatefulWidget {
-  final fb.User user;
-  const SessionGate({super.key, required this.user});
+  final String uid;
+  const SessionGate({super.key, required this.uid});
   @override
   State<SessionGate> createState() => _SessionGateState();
 }
 
 class _SessionGateState extends State<SessionGate> {
-  late Future<bool> f = Svc.start(widget.user);
+  late Future<bool> f = Svc.start(widget.uid);
   bool done = false;
 
   @override
@@ -1505,25 +1471,24 @@ class _SessionGateState extends State<SessionGate> {
             return InfoScreen(
                 title: 'Could not start',
                 text: 'Please check your internet connection.\n${s.error}',
-                onRetry: () => setState(() => f = Svc.start(widget.user)));
+                onRetry: () => setState(() => f = Svc.start(widget.uid)));
           }
-          if (s.data! && !done) return OnboardScreen(user: widget.user, onDone: () => setState(() => done = true));
+          if (s.data! && !done) return OnboardScreen(onDone: () => setState(() => done = true));
           return const HomeScreen();
         },
       );
 }
 
 class OnboardScreen extends StatefulWidget {
-  final fb.User user;
   final VoidCallback onDone;
-  const OnboardScreen({super.key, required this.user, required this.onDone});
+  const OnboardScreen({super.key, required this.onDone});
   @override
   State<OnboardScreen> createState() => _OnboardState();
 }
 
 class _OnboardState extends State<OnboardScreen> {
   late final TextEditingController un = TextEditingController();
-  late final TextEditingController nm = TextEditingController(text: widget.user.displayName ?? '');
+  late final TextEditingController nm = TextEditingController();
   bool busy = false;
   String? err;
 
@@ -1559,27 +1524,39 @@ class _OnboardState extends State<OnboardScreen> {
   }
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-        appBar: AppBar(title: const Text('Set up your profile'), actions: [TextButton(onPressed: signOut, child: const Text('Sign out'))]),
-        body: Padding(
+  Widget build(BuildContext context) {
+    final acc = accents[Prefs.accent];
+    return Scaffold(
+      body: SafeArea(
+        child: Padding(
           padding: const EdgeInsets.all(24),
-          child: Column(children: [
-            TextField(controller: nm, maxLength: 40, decoration: const InputDecoration(labelText: 'Your name', border: OutlineInputBorder())),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            const SizedBox(height: 24),
+            Icon(Icons.chat_bubble, size: 64, color: acc),
+            const SizedBox(height: 12),
+            const Text(Cfg.appName, textAlign: TextAlign.center, style: TextStyle(fontSize: 28, fontWeight: FontWeight.w800)),
+            const SizedBox(height: 8),
+            const Text('Choose a display name and a unique @username to start chatting.', textAlign: TextAlign.center),
+            const SizedBox(height: 28),
+            TextField(controller: nm, maxLength: 40, textCapitalization: TextCapitalization.words, decoration: const InputDecoration(labelText: 'Your name', border: OutlineInputBorder())),
             const SizedBox(height: 12),
             TextField(
                 controller: un,
                 maxLength: 20,
                 autocorrect: false,
-                decoration: const InputDecoration(labelText: 'Username (your unique ID)', prefixText: '@', border: OutlineInputBorder())),
+                decoration: const InputDecoration(labelText: 'Username (unique ID)', prefixText: '@', border: OutlineInputBorder())),
             if (err != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text(err!, style: const TextStyle(color: Colors.redAccent))),
             const SizedBox(height: 16),
             SizedBox(
-                width: double.infinity,
                 height: 50,
-                child: FilledButton(onPressed: busy ? null : _save, child: busy ? const CircularProgressIndicator() : const Text('Continue'))),
+                child: FilledButton(onPressed: busy ? null : _save, child: busy ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2)) : const Text('Continue'))),
+            const Spacer(),
+            TextButton(onPressed: signOut, child: const Text('Reset this device identity')),
           ]),
         ),
-      );
+      ),
+    );
+  }
 }
 
 // ───────────────────────── Home ─────────────────────────
