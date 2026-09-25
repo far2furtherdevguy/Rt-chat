@@ -1,4 +1,4 @@
-name: Build RT Chat APK file
+name: Build RT Chat APK
 
 on:
   push:
@@ -108,16 +108,16 @@ jobs:
           mkdir -p android/app/src/main
           ls android
 
-      - name: Patch Android project (label, permissions, SDK levels, desugaring)
-        run: |
+          - name: Patch Android project (label, permissions, SDK levels, desugaring)
+            run: |
           python3 - <<'PY'
-          import os, re, pathlib
+          import os, re, pathlib, textwrap
           root = pathlib.Path('android')
           compile_sdk = os.environ.get('ANDROID_COMPILE_SDK', '36')
           target_sdk = os.environ.get('ANDROID_TARGET_SDK', '36')
           min_sdk = os.environ.get('ANDROID_MIN_SDK', '23')
 
-          # ── Manifest: app name + permissions ──
+          # Manifest: app name + permissions
           mf = root / 'app/src/main/AndroidManifest.xml'
           s = mf.read_text()
           s = re.sub(r'android:label="[^"]*"', 'android:label="RT Chat"', s, count=1)
@@ -126,11 +126,11 @@ jobs:
               'android.permission.POST_NOTIFICATIONS',
               'android.permission.VIBRATE',
           ]
-          add = ''.join('    <uses-permission android:name="%s"/>\n' % p for p in perms if p not in s)
-          s = s.replace('<application', add + '    <application', 1)
+          add_p = ''.join('    <uses-permission android:name="%s"/>\n' % p for p in perms if p not in s)
+          s = s.replace('<application', add_p + '    <application', 1)
           mf.write_text(s)
 
-          # ── app-level gradle (Kotlin DSL or Groovy) ──
+          # App-level gradle (Kotlin DSL or Groovy)
           g = None
           for name in ('build.gradle.kts', 'build.gradle'):
               cand = root / 'app' / name
@@ -195,61 +195,59 @@ jobs:
           print('Patched app gradle:', g)
           print('  compileSdk/targetSdk/minSdk ->', compile_sdk, target_sdk, min_sdk)
 
-          # ── Force compileSdk on EVERY Android subproject (file_picker, etc.) ──
-          # App-level compileSdk alone is not enough: plugins keep their own
-          # android { compileSdk 34 } and CheckAarMetadata then fails.
+          # Force compileSdk on every Android subproject (file_picker, etc.)
           marker = 'forceCompileSdkForPlugins'
           root_kts = root / 'build.gradle.kts'
           root_groovy = root / 'build.gradle'
 
+          # Build snippet with textwrap so YAML never sees unindented braces
           if root_kts.exists():
               rb = root_kts
-              snippet = """
-
-// forceCompileSdkForPlugins: bump plugin compileSdk so AAR metadata checks pass
-subprojects {
-    afterEvaluate {
-        val ext = extensions.findByName("android") ?: return@afterEvaluate
-        try {
-            ext.javaClass.methods
-                .find { it.name == "setCompileSdkVersion" && it.parameterCount == 1 }
-                ?.invoke(ext, COMPILE_SDK_PLACEHOLDER)
-        } catch (_: Throwable) {}
-        try {
-            ext.javaClass.methods
-                .find { it.name == "setCompileSdk" && it.parameterCount == 1 }
-                ?.invoke(ext, COMPILE_SDK_PLACEHOLDER)
-        } catch (_: Throwable) {}
-    }
-}
-""".replace('COMPILE_SDK_PLACEHOLDER', compile_sdk)
+              snippet = textwrap.dedent("""
+                  // forceCompileSdkForPlugins
+                  subprojects {
+                      afterEvaluate {
+                          val ext = extensions.findByName("android") ?: return@afterEvaluate
+                          try {
+                              ext.javaClass.methods
+                                  .find { it.name == "setCompileSdkVersion" && it.parameterCount == 1 }
+                                  ?.invoke(ext, __SDK__)
+                          } catch (_: Throwable) {}
+                          try {
+                              ext.javaClass.methods
+                                  .find { it.name == "setCompileSdk" && it.parameterCount == 1 }
+                                  ?.invoke(ext, __SDK__)
+                          } catch (_: Throwable) {}
+                      }
+                  }
+                  """).replace("__SDK__", compile_sdk)
           else:
               rb = root_groovy
-              snippet = """
-
-// forceCompileSdkForPlugins: bump plugin compileSdk so AAR metadata checks pass
-subprojects { subproject ->
-    subproject.afterEvaluate {
-        if (subproject.plugins.hasPlugin("com.android.library") ||
-            subproject.plugins.hasPlugin("com.android.application")) {
-            def androidExt = subproject.extensions.findByName("android")
-            if (androidExt != null) {
-                try { androidExt.compileSdkVersion = COMPILE_SDK_PLACEHOLDER } catch (Throwable ignored) {}
-                try { androidExt.compileSdk = COMPILE_SDK_PLACEHOLDER } catch (Throwable ignored) {}
-            }
-        }
-    }
-}
-""".replace('COMPILE_SDK_PLACEHOLDER', compile_sdk)
+              snippet = textwrap.dedent("""
+                  // forceCompileSdkForPlugins
+                  subprojects { subproject ->
+                      subproject.afterEvaluate {
+                          if (subproject.plugins.hasPlugin("com.android.library") ||
+                              subproject.plugins.hasPlugin("com.android.application")) {
+                              def androidExt = subproject.extensions.findByName("android")
+                              if (androidExt != null) {
+                                  try { androidExt.compileSdkVersion = __SDK__ } catch (Throwable ignored) {}
+                                  try { androidExt.compileSdk = __SDK__ } catch (Throwable ignored) {}
+                              }
+                          }
+                      }
+                  }
+                  """).replace("__SDK__", compile_sdk)
 
           existing = rb.read_text() if rb.exists() else ''
           if marker not in existing:
-              rb.write_text(existing.rstrip() + snippet)
+              rb.write_text(existing.rstrip() + "\n" + snippet)
               print('Forced compileSdk on all subprojects via', rb)
           else:
               print('Subproject compileSdk force already present in', rb)
 
-          (root / 'app/proguard-rules.pro').write_text(
+          proguard = root / 'app/proguard-rules.pro'
+          proguard.write_text(
               '-keep class com.dexterous.** { *; }\n'
               '-keep class io.flutter.** { *; }\n'
               '-keep class com.google.gson.** { *; }\n'
@@ -257,15 +255,15 @@ subprojects { subproject ->
           )
 
           gp = root / 'gradle.properties'
-          extra = (
-              '\norg.gradle.caching=true\n'
-              'org.gradle.parallel=true\n'
-              'android.useAndroidX=true\n'
-              'android.nonTransitiveRClass=true\n'
-          )
+          extra_lines = [
+              'org.gradle.caching=true',
+              'org.gradle.parallel=true',
+              'android.useAndroidX=true',
+              'android.nonTransitiveRClass=true',
+          ]
           existing = gp.read_text() if gp.exists() else ''
-          for line in extra.strip().splitlines():
-              if line and line not in existing:
+          for line in extra_lines:
+              if line not in existing:
                   existing += '\n' + line
           gp.write_text(existing.rstrip() + '\n')
 
