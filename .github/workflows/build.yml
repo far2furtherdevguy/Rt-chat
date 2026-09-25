@@ -1,0 +1,188 @@
+name: Build RT Chat APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+      FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+      FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
+      FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+      FIREBASE_SENDER_ID: ${{ secrets.FIREBASE_SENDER_ID }}
+      GOOGLE_WEB_CLIENT_ID: ${{ secrets.GOOGLE_WEB_CLIENT_ID }}
+      GIPHY_API_KEY: ${{ secrets.GIPHY_API_KEY }}
+      MAX_UPLOAD_MB: ${{ vars.MAX_UPLOAD_MB || '25' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check required secrets
+        run: |
+          missing=""
+          for v in SUPABASE_URL SUPABASE_ANON_KEY FIREBASE_API_KEY FIREBASE_APP_ID FIREBASE_PROJECT_ID FIREBASE_SENDER_ID GOOGLE_WEB_CLIENT_ID; do
+            if [ -z "${!v}" ]; then missing="$missing $v"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::warning::Missing secrets:$missing - the APK will build but show a 'Setup needed' screen. See README.md."
+          fi
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # Caching Gradle + Maven downloads avoids Maven Central / Google Maven rate limits on repeat builds.
+      - name: Cache Gradle and Maven downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.m2/repository
+          key: gradle-${{ runner.os }}-${{ hashFiles('pubspec.yaml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      # Google Sign-In only works if the APK is signed with a key whose SHA-1 is registered in Firebase.
+      # Keeping the same debug keystore between runs keeps that SHA-1 stable.
+      - name: Restore signing keystore
+        id: ks
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: rtchat-debug-keystore-v1
+
+      - name: Prepare signing keystore and print fingerprints
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkeypair -keystore ~/.android/debug.keystore -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+            echo "Created a new signing keystore."
+          fi
+          FP=$(keytool -list -v -keystore ~/.android/debug.keystore -alias androiddebugkey -storepass android | grep -E "SHA1:|SHA256:" | sed 's/^ *//')
+          echo "$FP"
+          {
+            echo "### Signing fingerprints (add the SHA-1 to your Firebase Android app)"
+            echo '```'
+            echo "$FP"
+            echo '```'
+            echo "Package name: \`com.rtchat.rt_chat\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The repo only holds Dart code. The Android project is generated here, so there are no
+      # missing gradle/scaffold directory errors.
+      - name: Create Android scaffold (if missing)
+        run: |
+          if [ ! -d android ]; then
+            flutter create --platforms=android --org com.rtchat --project-name rt_chat --no-pub /tmp/scaffold
+            cp -r /tmp/scaffold/android ./android
+          fi
+          mkdir -p android/app/src/main
+          ls android
+
+      - name: Patch Android project (label, permissions, minSdk, desugaring)
+        run: |
+          python3 - <<'PY'
+          import re, pathlib
+          root = pathlib.Path('android')
+
+          # Manifest: app name + permissions
+          mf = root / 'app/src/main/AndroidManifest.xml'
+          s = mf.read_text()
+          s = re.sub(r'android:label="[^"]*"', 'android:label="RT Chat"', s, count=1)
+          perms = ['android.permission.INTERNET', 'android.permission.POST_NOTIFICATIONS', 'android.permission.VIBRATE']
+          add = ''.join('    <uses-permission android:name="%s"/>\n' % p for p in perms if p not in s)
+          s = s.replace('<application', add + '    <application', 1)
+          mf.write_text(s)
+
+          # app-level gradle (Kotlin DSL or Groovy)
+          g = None
+          for name in ('build.gradle.kts', 'build.gradle'):
+              cand = root / 'app' / name
+              if cand.exists():
+                  g = cand
+                  break
+          if g is None:
+              raise SystemExit('android/app/build.gradle(.kts) not found')
+          kts = g.name.endswith('.kts')
+          t = g.read_text()
+          t = re.sub(r'minSdk(Version)?(\s*=\s*|\s+)flutter\.minSdkVersion',
+                     lambda m: 'minSdk%s%s23' % (m.group(1) or '', m.group(2)), t)
+          if 'oreLibraryDesugaring' not in t:
+              flag = 'isCoreLibraryDesugaringEnabled = true' if kts else 'coreLibraryDesugaringEnabled true'
+              t = re.sub(r'compileOptions\s*\{', lambda m: m.group(0) + '\n        ' + flag, t, count=1)
+              dep = ('coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")' if kts
+                     else "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'")
+              t += '\ndependencies {\n    ' + dep + '\n}\n'
+          g.write_text(t)
+
+          # Keep R8 from stripping notification / plugin classes in release builds
+          (root / 'app/proguard-rules.pro').write_text(
+              '-keep class com.dexterous.** { *; }\n'
+              '-keep class io.flutter.** { *; }\n'
+              '-keep class com.google.gson.** { *; }\n'
+              '-dontwarn com.google.android.play.core.**\n')
+
+          # Gradle performance / caching
+          gp = root / 'gradle.properties'
+          extra = '\norg.gradle.caching=true\norg.gradle.parallel=true\nandroid.useAndroidX=true\n'
+          gp.write_text((gp.read_text() if gp.exists() else '') + extra)
+          print('Android project patched:', g)
+          PY
+
+      - name: Get packages
+        run: flutter pub get
+
+      - name: Build release APK (retries on flaky downloads)
+        run: |
+          for i in 1 2 3; do
+            if flutter build apk --release --target-platform android-arm,android-arm64 \
+              --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+              --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY" \
+              --dart-define=FIREBASE_API_KEY="$FIREBASE_API_KEY" \
+              --dart-define=FIREBASE_APP_ID="$FIREBASE_APP_ID" \
+              --dart-define=FIREBASE_PROJECT_ID="$FIREBASE_PROJECT_ID" \
+              --dart-define=FIREBASE_SENDER_ID="$FIREBASE_SENDER_ID" \
+              --dart-define=GOOGLE_WEB_CLIENT_ID="$GOOGLE_WEB_CLIENT_ID" \
+              --dart-define=GIPHY_API_KEY="$GIPHY_API_KEY" \
+              --dart-define=MAX_UPLOAD_MB="$MAX_UPLOAD_MB"; then
+              break
+            fi
+            echo "Build attempt $i failed."
+            if [ "$i" -eq 3 ]; then exit 1; fi
+            sleep 20
+          done
+
+      - name: Name the APK
+        run: cp build/app/outputs/flutter-apk/app-release.apk RT-Chat.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RT-Chat-apk
+          path: RT-Chat.apk
+          retention-days: 30
