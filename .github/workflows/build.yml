@@ -132,6 +132,8 @@ jobs:
           t = g.read_text()
           t = re.sub(r'minSdk(Version)?(\s*=\s*|\s+)flutter\.minSdkVersion',
                      lambda m: 'minSdk%s%s23' % (m.group(1) or '', m.group(2)), t)
+          t = re.sub(r'compileSdk(Version)?(\s*=\s*|\s+)flutter\.compileSdkVersion',
+                     lambda m: 'compileSdk%s%s36' % (m.group(1) or '', m.group(2)), t)
           if 'oreLibraryDesugaring' not in t:
               flag = 'isCoreLibraryDesugaringEnabled = true' if kts else 'coreLibraryDesugaringEnabled true'
               t = re.sub(r'compileOptions\s*\{', lambda m: m.group(0) + '\n        ' + flag, t, count=1)
