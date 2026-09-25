@@ -37,12 +37,13 @@ jobs:
       - name: Check required secrets
         run: |
           missing=""
-          for v in SUPABASE_URL SUPABASE_ANON_KEY FIREBASE_API_KEY FIREBASE_APP_ID FIREBASE_PROJECT_ID FIREBASE_SENDER_ID GOOGLE_WEB_CLIENT_ID; do
+          for v in SUPABASE_URL SUPABASE_ANON_KEY; do
             if [ -z "${!v}" ]; then missing="$missing $v"; fi
           done
           if [ -n "$missing" ]; then
-            echo "::warning::Missing secrets:$missing - the APK will build but show a Setup needed screen. See README.md."
+            echo "::warning::Missing secrets:$missing - the APK will build but show a Setup needed screen."
           fi
+          # Firebase secrets are optional (app uses local identity, not Google sign-in).
 
       - name: Set up Java
         uses: actions/setup-java@v4
