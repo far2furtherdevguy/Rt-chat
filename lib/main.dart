@@ -8,9 +8,9 @@ import 'dart:io';
 import 'dart:isolate' show ReceivePort;
 import 'dart:math' as math;
 import 'dart:ui' show IsolateNameServer, PlatformDispatcher;
+import 'package:flutter/foundation.dart' show kDebugMode;
 
 import 'package:cached_network_image/cached_network_image.dart';
-import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:cryptography/cryptography.dart' as cr;
 import 'package:file_picker/file_picker.dart';
 import 'package:firebase_auth/firebase_auth.dart' as fb;
