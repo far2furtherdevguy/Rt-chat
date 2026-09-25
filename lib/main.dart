@@ -8,13 +8,13 @@ import 'dart:io';
 import 'dart:isolate' show ReceivePort;
 import 'dart:math' as math;
 import 'dart:ui' show IsolateNameServer, PlatformDispatcher;
-import 'package:flutter/foundation.dart' show kDebugMode;
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:cryptography/cryptography.dart' as cr;
 import 'package:file_picker/file_picker.dart';
 import 'package:firebase_auth/firebase_auth.dart' as fb;
 import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -1071,7 +1071,7 @@ class Svc {
   static Future<List<Profile>> searchUsers(String q) async {
     final s = _clean(q);
     if (s.isEmpty) return [];
-    final rows = await sb.from('profiles').select().or('username.ilike.*$s*,name.ilike.*$s*').neq('uid', me).limit(25);
+    final rows = await sb.from('profiles').select().or('username.ilike.%$s%,name.ilike.%$s%').neq('uid', me).limit(25);
     return [for (final r in rows) Profile.server(r)];
   }
 
