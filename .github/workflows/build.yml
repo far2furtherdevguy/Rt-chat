@@ -1,4 +1,4 @@
-name: Build RT Chat APK
+name: Build RT Chat APK file
 
 on:
   push:
