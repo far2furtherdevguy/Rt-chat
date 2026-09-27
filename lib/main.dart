@@ -492,27 +492,62 @@ class Crypt {
   static String pub = '';
   static final Map<String, cr.SecretKey> _pairCache = {};
 
-  static Future<void> init(String uid) async {
+  static Future<void> init(String uid, {List<int>? restoreSeed}) async {
     _pairCache.clear();
     final k = 'rt_seed_$uid';
-    String? s;
-    try {
-      s = await _store.read(key: k);
-    } catch (e) {
-      DLog.d('crypt', 'secure read failed: $e');
-    }
     List<int> seed;
-    if (s != null && s.isNotEmpty) {
-      seed = base64Decode(s);
-    } else {
-      final r = math.Random.secure();
-      seed = List<int>.generate(32, (_) => r.nextInt(256));
+    if (restoreSeed != null && restoreSeed.length == 32) {
+      seed = restoreSeed;
       await _store.write(key: k, value: base64Encode(seed));
-      DLog.d('crypt', 'generated new identity key');
+      DLog.d('crypt', 'restored identity key from backup');
+    } else {
+      String? s;
+      try {
+        s = await _store.read(key: k);
+      } catch (e) {
+        DLog.d('crypt', 'secure read failed: $e');
+      }
+      if (s != null && s.isNotEmpty) {
+        seed = base64Decode(s);
+      } else {
+        final r = math.Random.secure();
+        seed = List<int>.generate(32, (_) => r.nextInt(256));
+        await _store.write(key: k, value: base64Encode(seed));
+        DLog.d('crypt', 'generated new identity key');
+      }
     }
     _kp = await _x.newKeyPairFromSeed(seed);
     final pk = await _kp.extractPublicKey() as cr.SimplePublicKey;
     pub = base64Encode(pk.bytes);
+  }
+
+  static Future<List<int>?> readSeed(String uid) async {
+    try {
+      final s = await _store.read(key: 'rt_seed_$uid');
+      if (s == null || s.isEmpty) return null;
+      return base64Decode(s);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Derive an AES key from the account PIN to wrap/unwrap the identity seed.
+  static Future<cr.SecretKey> pinKey(String pin, String uid) async {
+    final h = await cr.Sha256().hash(utf8.encode('$pin|$uid|rt-chat-seed-v1'));
+    return cr.SecretKey(h.bytes);
+  }
+
+  static Future<String> backupSeed(String pin, String uid) async {
+    final seed = await readSeed(uid);
+    if (seed == null) throw 'No local key to back up';
+    final key = await pinKey(pin, uid);
+    return seal(key, base64Encode(seed));
+  }
+
+  static Future<List<int>> restoreSeed(String pin, String uid, String backup) async {
+    final key = await pinKey(pin, uid);
+    final b64 = await open(key, backup);
+    return base64Decode(b64);
   }
 
   static Future<cr.SecretKey> pair(String peerPubB64) async {
@@ -665,6 +700,11 @@ class Svc {
     };
     if (pin != null && pin.isNotEmpty) {
       row['pin_hash'] = await LocalAuth.hashPin(pin, me);
+      try {
+        row['key_backup'] = await Crypt.backupSeed(pin, me);
+      } catch (e) {
+        DLog.d('auth', 'key backup failed: $e');
+      }
     }
     await sb.from('profiles').insert(row);
     final saved = await sb.from('profiles').select().eq('uid', me).single();
@@ -672,22 +712,47 @@ class Svc {
     await Db.putProfile(meP!);
   }
 
-  /// Restore an account after reinstall. Legacy profiles (no pin_hash) need only the username.
+  /// Restore an account after reinstall.
+  /// - Accounts with a PIN + key_backup restore encryption keys (old chats readable).
+  /// - Legacy accounts (no PIN) restore the username only; old encrypted messages stay unreadable.
   static Future<void> loginWithUsername(String username, String pin) async {
     final u = username.trim().toLowerCase();
     final row = await sb.from('profiles').select().eq('username', u).maybeSingle();
     if (row == null) throw 'No account with that username.';
     final uid = row['uid'] as String;
     final hash = (row['pin_hash'] as String?)?.trim() ?? '';
+    final backup = (row['key_backup'] as String?)?.trim() ?? '';
+    List<int>? seed;
     if (hash.isEmpty) {
-      // Pre-password accounts: username alone is enough.
+      // Pre-PIN account: can restore identity id, but not E2E keys.
     } else {
       if (pin.isEmpty) throw 'This account needs its PIN.';
       final h = await LocalAuth.hashPin(pin, uid);
       if (h != hash) throw 'Wrong PIN.';
+      if (backup.isNotEmpty) {
+        try {
+          seed = await Crypt.restoreSeed(pin, uid, backup);
+        } catch (e) {
+          DLog.d('auth', 'seed restore failed: $e');
+          throw 'PIN ok but key backup could not be opened. Old messages may stay locked.';
+        }
+      }
     }
     await LocalAuth.setUid(uid);
+    // Pre-init seed so Svc.start → Crypt.init uses the restored key.
+    if (seed != null) {
+      await Crypt.init(uid, restoreSeed: seed);
+    }
     LocalAuth.rev.value++;
+  }
+
+  /// Let a legacy (no-PIN) account set a PIN and upload a key backup so future reinstalls keep chat history.
+  static Future<void> setRecoveryPin(String pin) async {
+    if (me.isEmpty) throw 'Not signed in';
+    if (!RegExp(r'^\d{4,8}$').hasMatch(pin)) throw 'PIN must be 4–8 digits.';
+    final hash = await LocalAuth.hashPin(pin, me);
+    final backup = await Crypt.backupSeed(pin, me);
+    await sb.from('profiles').update({'pin_hash': hash, 'key_backup': backup}).eq('uid', me);
   }
 
   /// Drop oldest remote media when the bucket is getting large (free-tier safety).
@@ -3520,6 +3585,27 @@ class _SettingsState extends State<SettingsScreen> {
           subtitle: Text('${Cfg.maxUploadMb} MB per file'),
         ),
         header('Account'),
+        ListTile(
+          leading: const Icon(Icons.pin),
+          title: const Text('Set recovery PIN'),
+          subtitle: const Text('Needed to restore chat encryption after reinstall (4–8 digits).'),
+          onTap: () async {
+            final p1 = await askText(context, 'New PIN', hint: '4–8 digits', maxLen: 8, obscure: true);
+            if (p1 == null || !mounted) return;
+            final p2 = await askText(context, 'Confirm PIN', hint: '4–8 digits', maxLen: 8, obscure: true);
+            if (p2 == null || !mounted) return;
+            if (p1 != p2) {
+              toast(context, 'PINs do not match');
+              return;
+            }
+            try {
+              await Svc.setRecoveryPin(p1);
+              if (mounted) toast(context, 'Recovery PIN saved. Remember it if you reinstall.');
+            } catch (e) {
+              if (mounted) toast(context, '$e');
+            }
+          },
+        ),
         ListTile(
           leading: const Icon(Icons.logout, color: Colors.redAccent),
           title: const Text('Sign out', style: TextStyle(color: Colors.redAccent)),
