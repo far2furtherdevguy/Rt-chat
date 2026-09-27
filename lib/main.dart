@@ -34,19 +34,32 @@ import 'package:video_player/video_player.dart';
 // ───────────────────────── Config ─────────────────────────
 class Cfg {
   static const appName = 'RT Chat';
-  static const version = '1.0.0';
-  static const supabaseUrl = String.fromEnvironment('SUPABASE_URL');
-  static const supabaseAnon = String.fromEnvironment('SUPABASE_ANON_KEY');
-  static const fbApiKey = String.fromEnvironment('FIREBASE_API_KEY');
-  static const fbAppId = String.fromEnvironment('FIREBASE_APP_ID');
-  static const fbProject = String.fromEnvironment('FIREBASE_PROJECT_ID');
-  static const fbSender = String.fromEnvironment('FIREBASE_SENDER_ID');
-  static const webClientId = String.fromEnvironment('GOOGLE_WEB_CLIENT_ID');
-  static const giphyKey = String.fromEnvironment('GIPHY_API_KEY');
+  static const version = '1.1.0';
+  // Raw env values (may contain accidental whitespace from secrets UI).
+  static const _supabaseUrl = String.fromEnvironment('SUPABASE_URL');
+  static const _supabaseAnon = String.fromEnvironment('SUPABASE_ANON_KEY');
+  static const _fbApiKey = String.fromEnvironment('FIREBASE_API_KEY');
+  static const _fbAppId = String.fromEnvironment('FIREBASE_APP_ID');
+  static const _fbProject = String.fromEnvironment('FIREBASE_PROJECT_ID');
+  static const _fbSender = String.fromEnvironment('FIREBASE_SENDER_ID');
+  static const _webClientId = String.fromEnvironment('GOOGLE_WEB_CLIENT_ID');
+  static const _giphyKey = String.fromEnvironment('GIPHY_API_KEY');
   static const maxUploadMb = int.fromEnvironment('MAX_UPLOAD_MB', defaultValue: 25);
   static const debugPassword = 'pass'; // dev debug log lock (not shown to users)
   static const editWindow = Duration(minutes: 15);
   static const deleteWindow = Duration(hours: 48);
+  /// Soft cap on remote media objects for free-tier Supabase (~1 GB). Local copies stay on device.
+  static const storageFileSoftLimit = 100;
+
+  static String get supabaseUrl => _supabaseUrl.trim();
+  static String get supabaseAnon => _supabaseAnon.trim();
+  static String get fbApiKey => _fbApiKey.trim();
+  static String get fbAppId => _fbAppId.trim();
+  static String get fbProject => _fbProject.trim();
+  static String get fbSender => _fbSender.trim();
+  static String get webClientId => _webClientId.trim();
+  static String get giphyKey => _giphyKey.trim();
+
   /// Supabase is required. Firebase is optional (Google sign-in not required).
   static bool get configured => supabaseUrl.isNotEmpty && supabaseAnon.isNotEmpty;
   static bool get firebaseConfigured =>
@@ -60,6 +73,9 @@ class LocalAuth {
   static const FlutterSecureStorage _store = FlutterSecureStorage();
   static final Uuid _uuid = Uuid();
 
+  /// Bumped on sign-out / login so AuthGate reloads identity.
+  static final ValueNotifier<int> rev = ValueNotifier<int>(0);
+
   static Future<String?> readUid() async {
     try {
       final v = await _store.read(key: _key);
@@ -70,16 +86,26 @@ class LocalAuth {
     return Prefs.sp.getString(_key);
   }
 
-  static Future<String> ensureUid() async {
-    final existing = await readUid();
-    if (existing != null) return existing;
-    final id = _uuid.v4();
+  static Future<void> setUid(String id) async {
     try {
       await _store.write(key: _key, value: id);
     } catch (e) {
       DLog.d('auth', 'secure write uid failed: $e');
     }
     await Prefs.sp.setString(_key, id);
+  }
+
+  static Future<String> ensureUid() async {
+    final existing = await readUid();
+    if (existing != null) return existing;
+    final id = _uuid.v4();
+    await setUid(id);
+    return id;
+  }
+
+  static Future<String> newUid() async {
+    final id = _uuid.v4();
+    await setUid(id);
     return id;
   }
 
@@ -90,8 +116,11 @@ class LocalAuth {
     await Prefs.sp.remove(_key);
   }
 
-  /// Bumped on sign-out so AuthGate reloads identity.
-  static final ValueNotifier<int> rev = ValueNotifier<int>(0);
+  /// PIN is 4–8 digits. Hash is SHA-256(pin|uid|pepper).
+  static Future<String> hashPin(String pin, String uid) async {
+    final h = await cr.Sha256().hash(utf8.encode('$pin|$uid|rt-chat-pin-v1'));
+    return base64Encode(h.bytes);
+  }
 }
 
 // ───────────────────────── Debug log (hidden, password locked) ─────────────────────────
@@ -627,11 +656,104 @@ class Svc {
     return false;
   }
 
-  static Future<void> createProfile(String username, String name) async {
-    await sb.from('profiles').insert({'uid': me, 'username': username, 'name': name, 'pubkey': Crypt.pub});
-    final row = await sb.from('profiles').select().eq('uid', me).single();
-    meP = Profile.server(row);
+  static Future<void> createProfile(String username, String name, {String? pin}) async {
+    final row = <String, dynamic>{
+      'uid': me,
+      'username': username,
+      'name': name,
+      'pubkey': Crypt.pub,
+    };
+    if (pin != null && pin.isNotEmpty) {
+      row['pin_hash'] = await LocalAuth.hashPin(pin, me);
+    }
+    await sb.from('profiles').insert(row);
+    final saved = await sb.from('profiles').select().eq('uid', me).single();
+    meP = Profile.server(saved);
     await Db.putProfile(meP!);
+  }
+
+  /// Restore an account after reinstall. Legacy profiles (no pin_hash) need only the username.
+  static Future<void> loginWithUsername(String username, String pin) async {
+    final u = username.trim().toLowerCase();
+    final row = await sb.from('profiles').select().eq('username', u).maybeSingle();
+    if (row == null) throw 'No account with that username.';
+    final uid = row['uid'] as String;
+    final hash = (row['pin_hash'] as String?)?.trim() ?? '';
+    if (hash.isEmpty) {
+      // Pre-password accounts: username alone is enough.
+    } else {
+      if (pin.isEmpty) throw 'This account needs its PIN.';
+      final h = await LocalAuth.hashPin(pin, uid);
+      if (h != hash) throw 'Wrong PIN.';
+    }
+    await LocalAuth.setUid(uid);
+    LocalAuth.rev.value++;
+  }
+
+  /// Drop oldest remote media when the bucket is getting large (free-tier safety).
+  /// Phone-local copies are not touched.
+  static Future<void> purgeStorageIfNeeded() async {
+    try {
+      final root = await sb.storage.from('media').list();
+      final paths = <String>[];
+      final stamped = <(String, DateTime)>[];
+      for (final item in root) {
+        final meta = item.metadata;
+        final isFolder = meta == null || (item.id == null && (meta['mimetype'] == null && meta['size'] == null));
+        if (isFolder && item.name != 'avatars') {
+          try {
+            final kids = await sb.storage.from('media').list(path: item.name);
+            for (final k in kids) {
+              final pth = '${item.name}/${k.name}';
+              paths.add(pth);
+              DateTime ts = DateTime.fromMillisecondsSinceEpoch(0);
+              try {
+                if (k.createdAt != null) ts = DateTime.tryParse(k.createdAt!) ?? ts;
+              } catch (_) {}
+              stamped.add((pth, ts));
+            }
+          } catch (e) {
+            DLog.d('purge', 'list ${item.name}: $e');
+          }
+        } else if (item.name.isNotEmpty) {
+          final pth = item.name;
+          DateTime ts = DateTime.fromMillisecondsSinceEpoch(0);
+          try {
+            if (item.createdAt != null) ts = DateTime.tryParse(item.createdAt!) ?? ts;
+          } catch (_) {}
+          stamped.add((pth, ts));
+        }
+      }
+      // Also scan avatars folder
+      try {
+        final av = await sb.storage.from('media').list(path: 'avatars');
+        for (final k in av) {
+          final pth = 'avatars/${k.name}';
+          DateTime ts = DateTime.fromMillisecondsSinceEpoch(0);
+          try {
+            if (k.createdAt != null) ts = DateTime.tryParse(k.createdAt!) ?? ts;
+          } catch (_) {}
+          stamped.add((pth, ts));
+        }
+      } catch (_) {}
+
+      if (stamped.length <= Cfg.storageFileSoftLimit) return;
+      stamped.sort((a, b) => a.$2.compareTo(b.$2));
+      final excess = stamped.length - Cfg.storageFileSoftLimit + 25;
+      final doomed = [for (final e in stamped.take(excess)) e.$1];
+      if (doomed.isEmpty) return;
+      for (var i = 0; i < doomed.length; i += 50) {
+        final chunk = doomed.sublist(i, i + 50 > doomed.length ? doomed.length : i + 50);
+        try {
+          await sb.storage.from('media').remove(chunk);
+        } catch (e) {
+          DLog.d('purge', 'remove: $e');
+        }
+      }
+      DLog.d('purge', 'removed ${doomed.length} remote files (kept local copies)');
+    } catch (e) {
+      DLog.d('purge', '$e');
+    }
   }
 
   static Future<void> updateProfile({String? name, String? about, String? photo}) async {
@@ -653,6 +775,8 @@ class Svc {
       _startPresence();
       _registerPort();
       _retry = Timer.periodic(const Duration(seconds: 15), (_) => flushPending());
+      // Occasional free-tier storage sweep (does not delete local phone files).
+      Timer(const Duration(seconds: 8), () => unawaited(purgeStorageIfNeeded()));
     }
     await sync();
   }
@@ -1012,6 +1136,7 @@ class Svc {
     await sb.storage
         .from('media')
         .upload(key, File(path), fileOptions: FileOptions(contentType: mimeOf(name), upsert: true));
+    unawaited(purgeStorageIfNeeded());
     return sb.storage.from('media').getPublicUrl(key);
   }
 
@@ -1407,7 +1532,7 @@ class Avatar extends StatelessWidget {
   }
 }
 
-// ───────────────────────── Auth (local identity — no Google) ─────────────────────────
+// ───────────────────────── Auth (local identity + optional PIN recovery) ─────────────────────────
 class AuthGate extends StatefulWidget {
   const AuthGate({super.key});
   @override
@@ -1415,12 +1540,13 @@ class AuthGate extends StatefulWidget {
 }
 
 class _AuthGateState extends State<AuthGate> {
-  late Future<String> _uid = LocalAuth.ensureUid();
+  Future<String?>? _uid;
 
   @override
   void initState() {
     super.initState();
     LocalAuth.rev.addListener(_reload);
+    _uid = LocalAuth.readUid();
   }
 
   @override
@@ -1431,23 +1557,154 @@ class _AuthGateState extends State<AuthGate> {
 
   void _reload() {
     if (!mounted) return;
-    setState(() => _uid = LocalAuth.ensureUid());
+    setState(() => _uid = LocalAuth.readUid());
   }
 
   @override
-  Widget build(BuildContext context) => FutureBuilder<String>(
+  Widget build(BuildContext context) => FutureBuilder<String?>(
         future: _uid,
         builder: (c, s) {
           if (s.connectionState != ConnectionState.done) return const Splash();
-          if (s.hasError || s.data == null) {
+          if (s.hasError) {
             return InfoScreen(
               title: 'Could not start',
-              text: '${s.error ?? "Unknown error"}',
-              onRetry: () => setState(() => _uid = LocalAuth.ensureUid()),
+              text: '${s.error}',
+              onRetry: () => setState(() => _uid = LocalAuth.readUid()),
             );
           }
-          return SessionGate(key: ValueKey('${s.data}-${LocalAuth.rev.value}'), uid: s.data!);
+          final uid = s.data;
+          if (uid != null && uid.isNotEmpty) {
+            return SessionGate(key: ValueKey('${uid}-${LocalAuth.rev.value}'), uid: uid);
+          }
+          return const WelcomeScreen();
         },
+      );
+}
+
+class WelcomeScreen extends StatelessWidget {
+  const WelcomeScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final acc = accents[Prefs.accent];
+    return Scaffold(
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(28),
+          child: Column(children: [
+            const Spacer(),
+            Icon(Icons.chat_bubble, size: 72, color: acc),
+            const SizedBox(height: 14),
+            const Text(Cfg.appName, style: TextStyle(fontSize: 30, fontWeight: FontWeight.w800)),
+            const SizedBox(height: 8),
+            const Text('Simple, fast, private messaging.', textAlign: TextAlign.center),
+            const Spacer(),
+            SizedBox(
+              width: double.infinity,
+              height: 50,
+              child: FilledButton(
+                onPressed: () async {
+                  await LocalAuth.newUid();
+                  LocalAuth.rev.value++;
+                },
+                child: const Text('Create account'),
+              ),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              height: 50,
+              child: OutlinedButton(
+                onPressed: () {
+                  Navigator.of(context).push(MaterialPageRoute(builder: (_) => const LoginScreen()));
+                },
+                child: const Text('Log in with username'),
+              ),
+            ),
+            const SizedBox(height: 24),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+  @override
+  State<LoginScreen> createState() => _LoginState();
+}
+
+class _LoginState extends State<LoginScreen> {
+  final un = TextEditingController();
+  final pin = TextEditingController();
+  bool busy = false;
+  String? err;
+
+  Future<void> _go() async {
+    final u = un.text.trim().toLowerCase();
+    if (u.isEmpty) {
+      setState(() => err = 'Enter your username.');
+      return;
+    }
+    setState(() {
+      busy = true;
+      err = null;
+    });
+    try {
+      await Svc.loginWithUsername(u, pin.text.trim());
+      if (mounted) Navigator.of(context).pop(); // AuthGate rebuilds via LocalAuth.rev
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          busy = false;
+          err = '$e';
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('Log in')),
+        body: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(children: [
+            const Text(
+              'Use the username from an account you already created. '
+              'If that account has a PIN, enter it. Older accounts (before PIN support) only need the username.',
+              style: TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 20),
+            TextField(
+              controller: un,
+              autocorrect: false,
+              decoration: const InputDecoration(labelText: 'Username', prefixText: '@', border: OutlineInputBorder()),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: pin,
+              obscureText: true,
+              keyboardType: TextInputType.number,
+              maxLength: 8,
+              decoration: const InputDecoration(
+                labelText: 'PIN (if you set one)',
+                border: OutlineInputBorder(),
+                helperText: '4–8 digits. Leave blank for accounts made before PINs.',
+              ),
+            ),
+            if (err != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text(err!, style: const TextStyle(color: Colors.redAccent))),
+            const SizedBox(height: 16),
+            SizedBox(
+              width: double.infinity,
+              height: 48,
+              child: FilledButton(
+                onPressed: busy ? null : _go,
+                child: busy ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2)) : const Text('Log in'),
+              ),
+            ),
+          ]),
+        ),
       );
 }
 
@@ -1489,12 +1746,16 @@ class OnboardScreen extends StatefulWidget {
 class _OnboardState extends State<OnboardScreen> {
   late final TextEditingController un = TextEditingController();
   late final TextEditingController nm = TextEditingController();
+  late final TextEditingController pin = TextEditingController();
+  late final TextEditingController pin2 = TextEditingController();
   bool busy = false;
   String? err;
 
   Future<void> _save() async {
     final u = un.text.trim().toLowerCase();
     final n = nm.text.trim();
+    final p = pin.text.trim();
+    final p2 = pin2.text.trim();
     if (!RegExp(r'^[a-z0-9_]{3,20}$').hasMatch(u)) {
       setState(() => err = 'Username: 3-20 letters, numbers or underscore.');
       return;
@@ -1503,12 +1764,20 @@ class _OnboardState extends State<OnboardScreen> {
       setState(() => err = 'Enter your name.');
       return;
     }
+    if (!RegExp(r'^\d{4,8}$').hasMatch(p)) {
+      setState(() => err = 'PIN must be 4–8 digits (you will need it if you reinstall).');
+      return;
+    }
+    if (p != p2) {
+      setState(() => err = 'PINs do not match.');
+      return;
+    }
     setState(() {
       busy = true;
       err = null;
     });
     try {
-      await Svc.createProfile(u, n);
+      await Svc.createProfile(u, n, pin: p);
       widget.onDone();
     } on PostgrestException catch (e) {
       setState(() {
@@ -1518,7 +1787,7 @@ class _OnboardState extends State<OnboardScreen> {
     } catch (e) {
       setState(() {
         busy = false;
-        err = 'Could not save. Check your connection.';
+        err = 'Could not save. Check your connection.\n$e';
       });
     }
   }
@@ -1528,30 +1797,46 @@ class _OnboardState extends State<OnboardScreen> {
     final acc = accents[Prefs.accent];
     return Scaffold(
       body: SafeArea(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(24),
           child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            const SizedBox(height: 24),
-            Icon(Icons.chat_bubble, size: 64, color: acc),
             const SizedBox(height: 12),
-            const Text(Cfg.appName, textAlign: TextAlign.center, style: TextStyle(fontSize: 28, fontWeight: FontWeight.w800)),
+            Icon(Icons.chat_bubble, size: 56, color: acc),
+            const SizedBox(height: 10),
+            const Text(Cfg.appName, textAlign: TextAlign.center, style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800)),
             const SizedBox(height: 8),
-            const Text('Choose a display name and a unique @username to start chatting.', textAlign: TextAlign.center),
-            const SizedBox(height: 28),
+            const Text('Choose a name, username and PIN. The PIN lets you recover this account after reinstalling.', textAlign: TextAlign.center),
+            const SizedBox(height: 24),
             TextField(controller: nm, maxLength: 40, textCapitalization: TextCapitalization.words, decoration: const InputDecoration(labelText: 'Your name', border: OutlineInputBorder())),
             const SizedBox(height: 12),
             TextField(
                 controller: un,
                 maxLength: 20,
                 autocorrect: false,
-                decoration: const InputDecoration(labelText: 'Username (unique ID)', prefixText: '@', border: OutlineInputBorder())),
+                decoration: const InputDecoration(labelText: 'Username (unique)', prefixText: '@', border: OutlineInputBorder())),
+            const SizedBox(height: 12),
+            TextField(
+                controller: pin,
+                obscureText: true,
+                keyboardType: TextInputType.number,
+                maxLength: 8,
+                decoration: const InputDecoration(labelText: 'PIN (4–8 digits)', border: OutlineInputBorder())),
+            const SizedBox(height: 12),
+            TextField(
+                controller: pin2,
+                obscureText: true,
+                keyboardType: TextInputType.number,
+                maxLength: 8,
+                decoration: const InputDecoration(labelText: 'Confirm PIN', border: OutlineInputBorder())),
             if (err != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text(err!, style: const TextStyle(color: Colors.redAccent))),
             const SizedBox(height: 16),
             SizedBox(
                 height: 50,
-                child: FilledButton(onPressed: busy ? null : _save, child: busy ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2)) : const Text('Continue'))),
-            const Spacer(),
-            TextButton(onPressed: signOut, child: const Text('Reset this device identity')),
+                child: FilledButton(
+                    onPressed: busy ? null : _save,
+                    child: busy ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2)) : const Text('Continue'))),
+            const SizedBox(height: 12),
+            TextButton(onPressed: signOut, child: const Text('Back / reset')),
           ]),
         ),
       ),
