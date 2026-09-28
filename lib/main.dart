@@ -44,6 +44,9 @@ class Cfg {
   static const _fbSender = String.fromEnvironment('FIREBASE_SENDER_ID');
   static const _webClientId = String.fromEnvironment('GOOGLE_WEB_CLIENT_ID');
   static const _giphyKey = String.fromEnvironment('GIPHY_API_KEY');
+  static const _openRouterKey = String.fromEnvironment('OPENROUTER_API_KEY');
+  /// Free default: OpenRouter free router. For paid Grok set e.g. x-ai/grok-4.7 (no free Grok on OpenRouter).
+  static const _openRouterModel = String.fromEnvironment('OPENROUTER_MODEL', defaultValue: 'qwen/qwen3.8-27b:free');
   static const maxUploadMb = int.fromEnvironment('MAX_UPLOAD_MB', defaultValue: 25);
   static const debugPassword = 'pass'; // dev debug log lock (not shown to users)
   static const editWindow = Duration(minutes: 15);
@@ -59,6 +62,9 @@ class Cfg {
   static String get fbSender => _fbSender.trim();
   static String get webClientId => _webClientId.trim();
   static String get giphyKey => _giphyKey.trim();
+  static String get openRouterKey => _openRouterKey.trim();
+  static String get openRouterModel => _openRouterModel.trim().isEmpty ? 'qwen/qwen3.8-27b:free' : _openRouterModel.trim();
+  static bool get arteeEnabled => openRouterKey.isNotEmpty;
 
   /// Supabase is required. Firebase is optional (Google sign-in not required).
   static bool get configured => supabaseUrl.isNotEmpty && supabaseAnon.isNotEmpty;
@@ -254,11 +260,8 @@ String previewOf(Msg m) {
 }
 
 String chatTitle(ChatRow c, Map<String, Profile> pm) {
-  if (c.isDirect) {
-    final pr = pm[c.peer];
-    if (pr == null) return 'Chat';
-    return pr.name.isNotEmpty ? pr.name : '@${pr.username}';
-  }
+  if (c.isAi) return 'Artee AI';
+  if (c.isDirect) return pm[c.peer]?.name ?? 'Chat';
   return c.name.isEmpty ? 'Chat' : c.name;
 }
 
@@ -306,6 +309,7 @@ class ChatRow {
   bool get isDirect => kind == 'direct';
   bool get isGroup => kind == 'group';
   bool get isChannel => kind == 'channel';
+  bool get isAi => kind == 'ai';
   factory ChatRow.row(Map<String, Object?> r) => ChatRow(
         id: r['id'] as String,
         kind: (r['kind'] ?? 'direct') as String,
@@ -443,6 +447,33 @@ class Db {
 
   static Future<bool> hasMsg(String id) async => (await d.query('msgs', columns: ['id'], where: 'id=?', whereArgs: [id])).isNotEmpty;
 
+  static Future<void> putMsg(Msg m) async {
+    await d.insert(
+      'msgs',
+      {
+        'id': m.id,
+        'chat_id': m.chatId,
+        'sender': m.sender,
+        'kind': m.kind,
+        'body': m.body,
+        'media_url': m.mediaUrl,
+        'media_name': m.mediaName,
+        'local_path': m.localPath,
+        'reply_to': m.replyTo,
+        'media_size': m.mediaSize,
+        'ts': m.ts,
+        'status': m.status,
+        'my_rcpt': m.myRcpt,
+        'edited': m.edited ? 1 : 0,
+        'del_all': m.delAll ? 1 : 0,
+        'del_me': 0,
+        'pinned': m.pinned ? 1 : 0,
+        'pending': m.pending ? 1 : 0,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
   /// Insert/replace a message coming from the server, keeping local-only state.
   static Future<void> putServerMsg(Map<String, Object?> row) async {
     final ex = await d.query('msgs', columns: ['del_me', 'status', 'my_rcpt', 'local_path'], where: 'id=?', whereArgs: [row['id']]);
@@ -476,7 +507,11 @@ class Db {
       }
     }
     final out = [for (final r in rows) ChatItem(ChatRow.row(r), last[r['last_id']], _i(r['unread']))];
-    out.sort((a, b) => (b.last?.ts ?? b.chat.created).compareTo(a.last?.ts ?? a.chat.created));
+    out.sort((a, b) {
+      if (a.chat.isAi && !b.chat.isAi) return -1;
+      if (!a.chat.isAi && b.chat.isAi) return 1;
+      return (b.last?.ts ?? b.chat.created).compareTo(a.last?.ts ?? a.chat.created);
+    });
     return out;
   }
 }
@@ -650,6 +685,330 @@ class Notif {
 }
 
 final GlobalKey<NavigatorState> navKey = GlobalKey<NavigatorState>();
+
+// ───────────────────────── Artee AI (OpenRouter + free web search) ─────────────────────────
+/// Built-in assistant in RT Chat. Free OpenRouter model + client-side web search tool.
+/// Always presents as Artee AI (never Grok / underlying model names).
+class ArteeAi {
+  static const chatId = 'artee-ai';
+  static const senderId = 'artee-ai';
+
+  static const systemPrompt = """
+You are Artee AI, the built-in assistant inside the RT Chat messaging app.
+
+Identity rules (never break these):
+- Your name is Artee AI. Never say you are Grok, ChatGPT, Claude, Gemini, Llama, Qwen, or any other model.
+- Never mention OpenRouter, xAI, providers, or the underlying model name.
+- If asked who you are: "I'm Artee AI, the assistant built into RT Chat."
+
+Style:
+- Helpful, friendly, clear, lightly witty - like a smart friend in the chat.
+- Concise unless the user asks for depth.
+
+Tools:
+- You have a web_search tool. Use it when the user needs current facts, news, prices, scores, "today", "latest", or anything that may change.
+- Do not invent live data. If search returns nothing useful, say so.
+- After search results arrive, answer in plain language. You may briefly cite sources by name/URL.
+- You can also help with writing, ideas, explanations, study, and RT Chat tips without searching.
+""";
+
+  /// OpenAI-style tool the free model can call; we execute search on-device (no OpenRouter search fee).
+  static final List<Map<String, dynamic>> tools = [
+    {
+      'type': 'function',
+      'function': {
+        'name': 'web_search',
+        'description':
+            'Search the public web for current information. Use for news, facts, prices, sports, weather, or anything time-sensitive.',
+        'parameters': {
+          'type': 'object',
+          'properties': {
+            'query': {
+              'type': 'string',
+              'description': 'Short search query, e.g. "Nigeria election results 2026"',
+            },
+          },
+          'required': ['query'],
+        },
+      },
+    },
+  ];
+
+  static ChatRow chatRow() => ChatRow(
+        id: chatId,
+        kind: 'ai',
+        name: 'Artee AI',
+        owner: Svc.me,
+        created: nowMs(),
+      );
+
+  static Future<void> ensureChat() async {
+    final existing = await Db.chat(chatId);
+    if (existing != null) return;
+    await Db.putChat(chatRow());
+    Db.bump('*');
+  }
+
+  static String _scrub(String text) {
+    return text
+        .replaceAll(RegExp(r'\bI am Grok\b', caseSensitive: false), 'I am Artee AI')
+        .replaceAll(RegExp(r"\bI'm Grok\b", caseSensitive: false), "I'm Artee AI")
+        .replaceAll(RegExp(r'\bGrok\b'), 'Artee AI')
+        .replaceAll(RegExp(r'\bChatGPT\b'), 'Artee AI')
+        .replaceAll(RegExp(r'\bClaude\b'), 'Artee AI');
+  }
+
+  /// Free web search via DuckDuckGo Instant Answer API (no API key, no OpenRouter search cost).
+  static Future<String> webSearch(String query) async {
+    final q = query.trim();
+    if (q.isEmpty) return 'Empty query.';
+    try {
+      final uri = Uri.https('api.duckduckgo.com', '/', {
+        'q': q,
+        'format': 'json',
+        'no_html': '1',
+        'skip_disambig': '1',
+      });
+      final res = await http.get(uri, headers: {'User-Agent': 'RTChat-ArteeAI/1.0'}).timeout(const Duration(seconds: 20));
+      if (res.statusCode != 200) return 'Search failed (${res.statusCode}).';
+      final data = jsonDecode(res.body) as Map<String, dynamic>;
+      final buf = StringBuffer();
+      final heading = (data['Heading'] as String?)?.trim() ?? '';
+      final abs = (data['AbstractText'] as String?)?.trim() ?? '';
+      final absUrl = (data['AbstractURL'] as String?)?.trim() ?? '';
+      final answer = (data['Answer'] as String?)?.trim() ?? '';
+      final def = (data['Definition'] as String?)?.trim() ?? '';
+      if (heading.isNotEmpty) buf.writeln('Topic: $heading');
+      if (answer.isNotEmpty) buf.writeln('Answer: $answer');
+      if (abs.isNotEmpty) {
+        buf.writeln('Summary: $abs');
+        if (absUrl.isNotEmpty) buf.writeln('Source: $absUrl');
+      }
+      if (def.isNotEmpty) buf.writeln('Definition: $def');
+      final related = data['RelatedTopics'];
+      if (related is List) {
+        var n = 0;
+        for (final item in related) {
+          if (n >= 6) break;
+          if (item is Map) {
+            final text = (item['Text'] as String?)?.trim() ?? '';
+            final url = (item['FirstURL'] as String?)?.trim() ?? '';
+            if (text.isEmpty) continue;
+            n++;
+            buf.writeln('- $text${url.isNotEmpty ? ' ($url)' : ''}');
+          }
+        }
+      }
+      final results = data['Results'];
+      if (results is List) {
+        for (final item in results.take(4)) {
+          if (item is Map) {
+            final text = (item['Text'] as String?)?.trim() ?? '';
+            final url = (item['FirstURL'] as String?)?.trim() ?? '';
+            if (text.isNotEmpty) buf.writeln('- $text${url.isNotEmpty ? ' ($url)' : ''}');
+          }
+        }
+      }
+      final out = buf.toString().trim();
+      if (out.isEmpty) return await _wikiSearch(q);
+      return out;
+    } catch (e) {
+      DLog.d('artee-search', '$e');
+      try {
+        return await _wikiSearch(q);
+      } catch (e2) {
+        return 'Search unavailable: $e2';
+      }
+    }
+  }
+
+  static Future<String> _wikiSearch(String q) async {
+    final uri = Uri.https('en.wikipedia.org', '/w/api.php', {
+      'action': 'query',
+      'list': 'search',
+      'srsearch': q,
+      'srlimit': '5',
+      'format': 'json',
+      'utf8': '1',
+    });
+    final res = await http.get(uri, headers: {'User-Agent': 'RTChat-ArteeAI/1.0'}).timeout(const Duration(seconds: 15));
+    if (res.statusCode != 200) return 'No search results.';
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final search = (data['query'] as Map?)?['search'] as List? ?? [];
+    if (search.isEmpty) return 'No results found for "$q".';
+    final buf = StringBuffer('Wikipedia results for "$q":\n');
+    for (final item in search) {
+      if (item is! Map) continue;
+      final title = item['title'] ?? '';
+      final snippet = (item['snippet'] as String? ?? '').replaceAll(RegExp(r'<[^>]+>'), '');
+      buf.writeln('- $title: $snippet');
+    }
+    return buf.toString();
+  }
+
+  static Future<Map<String, dynamic>> _chatRequest(List<Map<String, dynamic>> messages, {bool withTools = true}) async {
+    final body = <String, dynamic>{
+      'model': Cfg.openRouterModel,
+      'messages': messages,
+      'temperature': 0.7,
+      'max_tokens': 1200,
+    };
+    if (withTools) {
+      body['tools'] = tools;
+      body['tool_choice'] = 'auto';
+    }
+    final res = await http
+        .post(
+          Uri.parse('https://openrouter.ai/api/v1/chat/completions'),
+          headers: {
+            'Authorization': 'Bearer ${Cfg.openRouterKey}',
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'https://rtchat.app',
+            'X-Title': 'RT Chat Artee AI',
+          },
+          body: jsonEncode(body),
+        )
+        .timeout(const Duration(seconds: 90));
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      DLog.d('artee', 'HTTP ${res.statusCode}: ${res.body}');
+      final low = res.body.toLowerCase();
+      if (res.statusCode == 401) throw 'Artee AI key is invalid. Check OPENROUTER_API_KEY.';
+      if (res.statusCode == 402 || low.contains('credit')) {
+        throw 'OpenRouter needs credits for this model. Keep OPENROUTER_MODEL on a :free id.';
+      }
+      if (res.statusCode == 429) throw 'Artee AI is busy (rate limit). Try again in a minute.';
+      throw _HttpErr(res.statusCode, res.body);
+    }
+    return jsonDecode(res.body) as Map<String, dynamic>;
+  }
+
+  static Future<String> complete(List<Msg> history, String userText) async {
+    if (!Cfg.arteeEnabled) {
+      return 'Artee AI is not set up yet. Add the OPENROUTER_API_KEY GitHub secret and rebuild the app.';
+    }
+    final recent = history.reversed.take(20).toList().reversed.toList();
+    final messages = <Map<String, dynamic>>[
+      {'role': 'system', 'content': systemPrompt.trim()},
+    ];
+    for (final m in recent) {
+      if (m.delAll || m.body.isEmpty || m.kind != 'text') continue;
+      final role = m.sender == senderId ? 'assistant' : 'user';
+      messages.add({'role': role, 'content': m.body});
+    }
+    if (messages.isEmpty || messages.last['role'] != 'user' || messages.last['content'] != userText) {
+      messages.add({'role': 'user', 'content': userText});
+    }
+
+    // Tool loop: model may request web_search; we run it locally (free) and feed results back.
+    const maxRounds = 3;
+    var useTools = true;
+    for (var round = 0; round < maxRounds; round++) {
+      Map<String, dynamic> data;
+      try {
+        data = await _chatRequest(messages, withTools: useTools);
+      } on _HttpErr catch (e) {
+        if (useTools && (e.code == 400 || e.code == 404 || e.body.contains('tool'))) {
+          useTools = false;
+          data = await _chatRequest(messages, withTools: false);
+        } else {
+          return 'Artee AI could not reply right now (${e.code}). Try again.';
+        }
+      }
+
+      final choices = data['choices'] as List?;
+      if (choices == null || choices.isEmpty) return 'Artee AI sent an empty reply.';
+      final msg = choices.first['message'] as Map<String, dynamic>? ?? {};
+      final toolCalls = msg['tool_calls'] as List?;
+
+      if (toolCalls == null || toolCalls.isEmpty) {
+        var text = (msg['content'] as String?)?.trim() ?? '';
+        if (text.isEmpty) return 'Artee AI sent an empty reply.';
+        return _scrub(text);
+      }
+
+      messages.add(msg);
+      for (final call in toolCalls) {
+        if (call is! Map) continue;
+        final id = call['id']?.toString() ?? 'call_$round';
+        final fn = call['function'] as Map? ?? {};
+        final name = fn['name']?.toString() ?? '';
+        var argsRaw = fn['arguments']?.toString() ?? '{}';
+        Map<String, dynamic> args = {};
+        try {
+          args = jsonDecode(argsRaw) as Map<String, dynamic>;
+        } catch (_) {}
+        String result;
+        if (name == 'web_search') {
+          final q = (args['query'] ?? userText).toString();
+          result = await webSearch(q);
+        } else {
+          result = 'Unknown tool: $name';
+        }
+        messages.add({
+          'role': 'tool',
+          'tool_call_id': id,
+          'content': result,
+        });
+      }
+    }
+    return 'Artee AI took too long searching. Try a shorter question.';
+  }
+
+  static Future<void> sendUserMessage(String text) async {
+    await ensureChat();
+    final id = Svc.newId();
+    final ts = nowMs();
+    final user = Msg(
+      id: id,
+      chatId: chatId,
+      sender: Svc.me,
+      kind: 'text',
+      body: text,
+      ts: ts,
+      status: 3,
+      pending: false,
+    );
+    await Db.putMsg(user);
+    Db.bump(chatId);
+
+    final aid = Svc.newId();
+    final thinking = Msg(
+      id: aid,
+      chatId: chatId,
+      sender: senderId,
+      kind: 'text',
+      body: '...',
+      ts: ts + 1,
+      status: 3,
+      pending: true,
+    );
+    await Db.putMsg(thinking);
+    Db.bump(chatId);
+
+    try {
+      final hist = await Db.messages(chatId, 40);
+      final ctx = [for (final m in hist) if (m.id != aid) m];
+      final reply = await complete(ctx, text);
+      await Db.d.update('msgs', {'body': reply, 'pending': 0}, where: 'id=?', whereArgs: [aid]);
+      Db.bump(chatId);
+    } catch (e) {
+      DLog.d('artee', '$e');
+      await Db.d.update('msgs', {
+        'body': '$e',
+        'pending': 0,
+      }, where: 'id=?', whereArgs: [aid]);
+      Db.bump(chatId);
+    }
+  }
+}
+
+class _HttpErr implements Exception {
+  final int code;
+  final String body;
+  _HttpErr(this.code, this.body);
+  @override
+  String toString() => 'HTTP $code';
+}
 
 // ───────────────────────── Service layer ─────────────────────────
 class Svc {
@@ -1318,6 +1677,11 @@ class Svc {
     ];
   }
 
+  static Future<ChatRow> openArtee() async {
+    await ArteeAi.ensureChat();
+    return (await Db.chat(ArteeAi.chatId)) ?? ArteeAi.chatRow();
+  }
+
   static Future<ChatRow> openDirect(Profile peer) async {
     final ids = [me, peer.uid]..sort();
     final id = 'd_${ids[0]}_${ids[1]}';
@@ -1931,6 +2295,7 @@ class _HomeState extends State<HomeScreen> with WidgetsBindingObserver, SingleTi
       if (!tc.indexIsChanging) setState(() {});
     });
     sub = Db.changes.listen((_) => load());
+    unawaited(ArteeAi.ensureChat());
     load();
     Svc.begin().whenComplete(() {
       if (mounted) setState(() => syncing = false);
@@ -1988,11 +2353,16 @@ class _HomeState extends State<HomeScreen> with WidgetsBindingObserver, SingleTi
         title: Text(Cfg.appName, style: TextStyle(fontWeight: FontWeight.w800, color: acc)),
         actions: [
           PopupMenuButton<String>(
-            onSelected: (v) {
+            onSelected: (v) async {
+              if (v == 'artee') {
+                final c = await Svc.openArtee();
+                if (context.mounted) Navigator.push(context, MaterialPageRoute(builder: (_) => ChatScreen(chat: c)));
+              }
               if (v == 'group') Navigator.push(context, MaterialPageRoute(builder: (_) => const UserSearchScreen(group: true)));
               if (v == 'settings') Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsScreen()));
             },
             itemBuilder: (_) => const [
+              PopupMenuItem(value: 'artee', child: Text('Artee AI')),
               PopupMenuItem(value: 'group', child: Text('New group')),
               PopupMenuItem(value: 'settings', child: Text('Settings')),
             ],
@@ -2031,7 +2401,7 @@ class ChatTile extends StatelessWidget {
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16),
         child: Row(children: [
-          Avatar(url: chatPhoto(c, pm), name: title, r: 26, icon: c.isChannel ? Icons.campaign : (c.isGroup ? Icons.groups : null)),
+          Avatar(url: chatPhoto(c, pm), name: title, r: 26, icon: c.isAi ? Icons.auto_awesome : (c.isChannel ? Icons.campaign : (c.isGroup ? Icons.groups : null))),
           const SizedBox(width: 14),
           Expanded(
             child: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -2323,7 +2693,7 @@ class _ChatState extends State<ChatScreen> {
   final scroll = ScrollController();
   StreamSubscription<String>? sub;
 
-  bool get canPost => !chat.isChannel || chat.owner == Svc.me;
+  bool get canPost => chat.isAi || !chat.isChannel || chat.owner == Svc.me;
 
   @override
   void initState() {
@@ -2434,7 +2804,11 @@ class _ChatState extends State<ChatScreen> {
     final r = replyTo;
     ctl.clear();
     setState(() => replyTo = null);
-    await Svc.send(chat, body: t, replyTo: r?.id);
+    if (chat.isAi) {
+      await ArteeAi.sendUserMessage(t);
+    } else {
+      await Svc.send(chat, body: t, replyTo: r?.id);
+    }
     toBottom();
   }
 
@@ -2655,7 +3029,7 @@ class _ChatState extends State<ChatScreen> {
           title: InkWell(
             onTap: info,
             child: Row(children: [
-              Avatar(url: chatPhoto(chat, profs), name: title, r: 19, icon: chat.isChannel ? Icons.campaign : (chat.isGroup ? Icons.groups : null)),
+              Avatar(url: chatPhoto(chat, profs), name: title, r: 19, icon: chat.isAi ? Icons.auto_awesome : (chat.isChannel ? Icons.campaign : (chat.isGroup ? Icons.groups : null))),
               const SizedBox(width: 10),
               Expanded(
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisAlignment: MainAxisAlignment.center, children: [
