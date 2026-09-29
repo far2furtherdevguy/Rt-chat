@@ -7,7 +7,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate' show ReceivePort;
 import 'dart:math' as math;
-import 'dart:ui' show IsolateNameServer, PlatformDispatcher;
+import 'dart:ui' as ui show FontFeature, IsolateNameServer, PlatformDispatcher, ImageByteFormat, instantiateImageCodec, Image, PathOperation;
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:cryptography/cryptography.dart' as cr;
@@ -24,6 +24,9 @@ import 'package:google_sign_in/google_sign_in.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -45,8 +48,9 @@ class Cfg {
   static const _webClientId = String.fromEnvironment('GOOGLE_WEB_CLIENT_ID');
   static const _giphyKey = String.fromEnvironment('GIPHY_API_KEY');
   static const _openRouterKey = String.fromEnvironment('OPENROUTER_API_KEY');
-  /// Free default: OpenRouter free router. For paid Grok set e.g. x-ai/grok-4.7 (no free Grok on OpenRouter).
-  static const _openRouterModel = String.fromEnvironment('OPENROUTER_MODEL', defaultValue: 'qwen/qwen3.8-27b:free');
+  /// Optional comma-separated extra keys for rotation when free tier rate-limits.
+  static const _openRouterKeysExtra = String.fromEnvironment('OPENROUTER_API_KEYS');
+  static const _openRouterModel = String.fromEnvironment('OPENROUTER_MODEL', defaultValue: 'openrouter/free');
   static const maxUploadMb = int.fromEnvironment('MAX_UPLOAD_MB', defaultValue: 25);
   static const debugPassword = 'pass'; // dev debug log lock (not shown to users)
   static const editWindow = Duration(minutes: 15);
@@ -63,8 +67,24 @@ class Cfg {
   static String get webClientId => _webClientId.trim();
   static String get giphyKey => _giphyKey.trim();
   static String get openRouterKey => _openRouterKey.trim();
-  static String get openRouterModel => _openRouterModel.trim().isEmpty ? 'qwen/qwen3.8-27b:free' : _openRouterModel.trim();
-  static bool get arteeEnabled => openRouterKey.isNotEmpty;
+  static String get openRouterModel =>
+      _openRouterModel.trim().isEmpty ? 'openrouter/free' : _openRouterModel.trim();
+
+  /// Primary key + optional extras (comma/newline/space separated).
+  static List<String> get openRouterKeys {
+    final raw = '$_openRouterKey,$_openRouterKeysExtra';
+    final seen = <String>{};
+    final out = <String>[];
+    for (final part in raw.split(RegExp(r'[,\s]+'))) {
+      final k = part.trim();
+      if (k.isEmpty || seen.contains(k)) continue;
+      seen.add(k);
+      out.add(k);
+    }
+    return out;
+  }
+
+  static bool get arteeEnabled => openRouterKeys.isNotEmpty;
 
   /// Supabase is required. Firebase is optional (Google sign-in not required).
   static bool get configured => supabaseUrl.isNotEmpty && supabaseAnon.isNotEmpty;
@@ -170,6 +190,12 @@ class Prefs {
   static int get accent => (sp.getInt('accent') ?? 0).clamp(0, accents.length - 1).toInt();
   static int get wall => (sp.getInt('wall') ?? 0).clamp(0, walls.length - 1).toInt();
   static bool get lowData => sp.getBool('low_data') ?? false;
+  static List<String> get customStickers => List<String>.from(sp.getStringList('custom_stickers') ?? const <String>[]);
+  static Future<void> setCustomStickers(List<String> paths) async {
+    await sp.setStringList('custom_stickers', paths);
+    rev.value++;
+  }
+
   static Future<void> setInt(String k, int v) async {
     await sp.setInt(k, v);
     rev.value++;
@@ -178,6 +204,49 @@ class Prefs {
   static Future<void> setBool(String k, bool v) async {
     await sp.setBool(k, v);
     rev.value++;
+  }
+}
+
+/// Custom image stickers stored under app documents.
+class StickerStore {
+  static Future<Directory> _dir() async {
+    final root = await getApplicationDocumentsDirectory();
+    final d = Directory(p.join(root.path, 'stickers'));
+    if (!await d.exists()) await d.create(recursive: true);
+    return d;
+  }
+
+  static Future<String?> importFromPath(String srcPath) async {
+    try {
+      final f = File(srcPath);
+      if (!await f.exists()) return null;
+      final dir = await _dir();
+      final name = 'stk_${DateTime.now().millisecondsSinceEpoch}${p.extension(srcPath).isEmpty ? '.png' : p.extension(srcPath)}';
+      final dest = p.join(dir.path, name);
+      await f.copy(dest);
+      final list = Prefs.customStickers.toList();
+      list.insert(0, dest);
+      // Cap library size
+      while (list.length > 80) {
+        final old = list.removeLast();
+        try {
+          await File(old).delete();
+        } catch (_) {}
+      }
+      await Prefs.setCustomStickers(list);
+      return dest;
+    } catch (e) {
+      DLog.d('sticker', '$e');
+      return null;
+    }
+  }
+
+  static Future<void> remove(String path) async {
+    final list = Prefs.customStickers.where((e) => e != path).toList();
+    await Prefs.setCustomStickers(list);
+    try {
+      await File(path).delete();
+    } catch (_) {}
   }
 }
 
@@ -249,7 +318,7 @@ String previewOf(Msg m) {
     case 'video':
       return '🎥 Video';
     case 'audio':
-      return '🎵 Audio';
+      return '🎤 Voice message';
     case 'gif':
       return 'GIF';
     case 'file':
@@ -636,7 +705,7 @@ class Keys {
 @pragma('vm:entry-point')
 void notifBg(NotificationResponse r) {
   if (r.actionId == 'reply' && r.input != null && r.payload != null) {
-    IsolateNameServer.lookupPortByName('rt_reply')?.send([r.payload, r.input]);
+    ui.IsolateNameServer.lookupPortByName('rt_reply')?.send([r.payload, r.input]);
   }
 }
 
@@ -846,9 +915,64 @@ Tools:
     return buf.toString();
   }
 
-  static Future<Map<String, dynamic>> _chatRequest(List<Map<String, dynamic>> messages, {bool withTools = true}) async {
+  static int _keyIdx = 0;
+  static int _modelIdx = 0;
+
+  /// Free models to try when the preferred one is rate-limited or missing.
+  static const fallbackModels = <String>[
+    'openrouter/free',
+    'qwen/qwen3.8-27b:free',
+    'nvidia/nemotron-3-nano-30b-a3b:free',
+    'meta-llama/llama-3.3-70b-instruct:free',
+    'google/gemma-3-27b-it:free',
+    'mistralai/mistral-small-3.1-24b-instruct:free',
+  ];
+
+  static List<String> get _models {
+    final pref = Cfg.openRouterModel;
+    final list = <String>[];
+    if (pref.isNotEmpty) list.add(pref);
+    for (final m in fallbackModels) {
+      if (!list.contains(m)) list.add(m);
+    }
+    return list;
+  }
+
+  static String get _currentKey {
+    final keys = Cfg.openRouterKeys;
+    if (keys.isEmpty) return '';
+    return keys[_keyIdx % keys.length];
+  }
+
+  static String get _currentModel {
+    final models = _models;
+    return models[_modelIdx % models.length];
+  }
+
+  static void _rotateKey() {
+    final keys = Cfg.openRouterKeys;
+    if (keys.length <= 1) return;
+    _keyIdx = (_keyIdx + 1) % keys.length;
+    DLog.d('artee', 'rotated API key -> index $_keyIdx');
+  }
+
+  static void _rotateModel() {
+    final models = _models;
+    if (models.length <= 1) return;
+    _modelIdx = (_modelIdx + 1) % models.length;
+    DLog.d('artee', 'rotated model -> ${_currentModel}');
+  }
+
+  static Future<Map<String, dynamic>> _chatRequest(
+    List<Map<String, dynamic>> messages, {
+    bool withTools = true,
+    String? model,
+    String? apiKey,
+  }) async {
+    final key = apiKey ?? _currentKey;
+    final mod = model ?? _currentModel;
     final body = <String, dynamic>{
-      'model': Cfg.openRouterModel,
+      'model': mod,
       'messages': messages,
       'temperature': 0.7,
       'max_tokens': 1200,
@@ -861,7 +985,7 @@ Tools:
         .post(
           Uri.parse('https://openrouter.ai/api/v1/chat/completions'),
           headers: {
-            'Authorization': 'Bearer ${Cfg.openRouterKey}',
+            'Authorization': 'Bearer $key',
             'Content-Type': 'application/json',
             'HTTP-Referer': 'https://rtchat.app',
             'X-Title': 'RT Chat Artee AI',
@@ -870,16 +994,68 @@ Tools:
         )
         .timeout(const Duration(seconds: 90));
     if (res.statusCode < 200 || res.statusCode >= 300) {
-      DLog.d('artee', 'HTTP ${res.statusCode}: ${res.body}');
+      DLog.d('artee', 'HTTP ${res.statusCode} model=$mod: ${res.body}');
       final low = res.body.toLowerCase();
       if (res.statusCode == 401) throw 'Artee AI key is invalid. Check OPENROUTER_API_KEY.';
       if (res.statusCode == 402 || low.contains('credit')) {
-        throw 'OpenRouter needs credits for this model. Keep OPENROUTER_MODEL on a :free id.';
+        throw 'OpenRouter needs credits for this model. Use a :free model id.';
       }
-      if (res.statusCode == 429) throw 'Artee AI is busy (rate limit). Try again in a minute.';
       throw _HttpErr(res.statusCode, res.body);
     }
     return jsonDecode(res.body) as Map<String, dynamic>;
+  }
+
+  /// Retries across keys and free models on 429 / model errors.
+  static Future<Map<String, dynamic>> _chatRequestResilient(
+    List<Map<String, dynamic>> messages, {
+    bool withTools = true,
+  }) async {
+    final keys = Cfg.openRouterKeys;
+    final models = _models;
+    final attempts = (keys.isEmpty ? 1 : keys.length) * models.length;
+    Object? lastErr;
+
+    for (var i = 0; i < attempts; i++) {
+      try {
+        return await _chatRequest(messages, withTools: withTools);
+      } on _HttpErr catch (e) {
+        lastErr = e;
+        final retryable = e.code == 429 || e.code == 503 || e.code == 502 ||
+            e.code == 404 || e.code == 400;
+        if (!retryable) rethrow;
+
+        // 429: rotate key first, then model; short backoff.
+        if (e.code == 429) {
+          if (keys.length > 1) {
+            _rotateKey();
+          } else {
+            _rotateModel();
+          }
+          // After trying all keys once on this model, also rotate model.
+          if (keys.length > 1 && (i + 1) % keys.length == 0) {
+            _rotateModel();
+          }
+          await Future<void>.delayed(Duration(milliseconds: 400 + 200 * i));
+          continue;
+        }
+        // Bad model / tools unsupported: drop tools or rotate model.
+        if (e.code == 400 || e.code == 404) {
+          if (withTools && (e.body.contains('tool') || e.body.contains('model'))) {
+            // Caller may retry without tools; signal via special code.
+            rethrow;
+          }
+          _rotateModel();
+          await Future<void>.delayed(const Duration(milliseconds: 300));
+          continue;
+        }
+        _rotateModel();
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+      }
+    }
+    if (lastErr is _HttpErr && lastErr.code == 429) {
+      throw 'Artee AI is rate-limited on free models. Wait a minute, or add more OPENROUTER_API_KEYS / a small OpenRouter credit.';
+    }
+    throw lastErr ?? 'Artee AI could not reply.';
   }
 
   static Future<String> complete(List<Msg> history, String userText) async {
@@ -899,20 +1075,23 @@ Tools:
       messages.add({'role': 'user', 'content': userText});
     }
 
-    // Tool loop: model may request web_search; we run it locally (free) and feed results back.
     const maxRounds = 3;
     var useTools = true;
     for (var round = 0; round < maxRounds; round++) {
       Map<String, dynamic> data;
       try {
-        data = await _chatRequest(messages, withTools: useTools);
+        data = await _chatRequestResilient(messages, withTools: useTools);
       } on _HttpErr catch (e) {
         if (useTools && (e.code == 400 || e.code == 404 || e.body.contains('tool'))) {
           useTools = false;
-          data = await _chatRequest(messages, withTools: false);
+          data = await _chatRequestResilient(messages, withTools: false);
+        } else if (e.code == 429) {
+          return 'Artee AI is rate-limited on free models. Wait a minute, or add more OPENROUTER_API_KEYS / a small OpenRouter credit.';
         } else {
           return 'Artee AI could not reply right now (${e.code}). Try again.';
         }
+      } catch (e) {
+        return e.toString();
       }
 
       final choices = data['choices'] as List?;
@@ -1212,7 +1391,7 @@ class Svc {
     await _pres?.unsubscribe();
     _db = null;
     _pres = null;
-    IsolateNameServer.removePortNameMapping('rt_reply');
+    ui.IsolateNameServer.removePortNameMapping('rt_reply');
     _port?.close();
     _port = null;
     me = '';
@@ -1239,11 +1418,11 @@ class Svc {
   }
 
   static void _registerPort() {
-    IsolateNameServer.removePortNameMapping('rt_reply');
+    ui.IsolateNameServer.removePortNameMapping('rt_reply');
     _port?.close();
     final rp = ReceivePort();
     _port = rp;
-    IsolateNameServer.registerPortWithName(rp.sendPort, 'rt_reply');
+    ui.IsolateNameServer.registerPortWithName(rp.sendPort, 'rt_reply');
     rp.listen((msg) {
       if (msg is List && msg.length == 2) replyFromNotif('${msg[0]}', '${msg[1]}');
     });
@@ -1759,7 +1938,7 @@ class Svc {
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   FlutterError.onError = (d) => DLog.d('flutter', d.exceptionAsString());
-  PlatformDispatcher.instance.onError = (e, s) {
+  ui.PlatformDispatcher.instance.onError = (e, s) {
     DLog.d('error', '$e');
     return true;
   };
@@ -1798,22 +1977,39 @@ class Boot {
 
 ThemeData buildTheme(Brightness b) {
   final acc = accents[Prefs.accent];
-  final cs = ColorScheme.fromSeed(seedColor: acc, brightness: b);
   final dark = b == Brightness.dark;
+  final cs = ColorScheme.fromSeed(
+    seedColor: acc,
+    brightness: b,
+    surface: dark ? const Color(0xFF0B141A) : const Color(0xFFF7F8FA),
+  );
   return ThemeData(
     useMaterial3: true,
     colorScheme: cs,
-    scaffoldBackgroundColor: dark ? const Color(0xFF0B141A) : Colors.white,
-    splashFactory: InkRipple.splashFactory, // lighter than the shader-based M3 sparkle (better on low-end GPUs)
+    scaffoldBackgroundColor: dark ? const Color(0xFF0B141A) : const Color(0xFFF0F2F5),
+    splashFactory: InkRipple.splashFactory,
     pageTransitionsTheme: const PageTransitionsTheme(builders: {
-      TargetPlatform.android: FadeUpwardsPageTransitionsBuilder(),
+      TargetPlatform.android: CupertinoPageTransitionsBuilder(),
     }),
     appBarTheme: AppBarTheme(
-      backgroundColor: dark ? const Color(0xFF1F2C34) : Colors.white,
-      foregroundColor: dark ? Colors.white : Colors.black87,
+      backgroundColor: dark ? const Color(0xFF1A242D) : Colors.white,
+      foregroundColor: dark ? Colors.white : const Color(0xFF111B21),
       elevation: 0,
-      scrolledUnderElevation: 0.5,
+      scrolledUnderElevation: 0.8,
+      centerTitle: false,
+      titleTextStyle: TextStyle(
+        fontSize: 18,
+        fontWeight: FontWeight.w700,
+        color: dark ? Colors.white : const Color(0xFF111B21),
+      ),
     ),
+    floatingActionButtonTheme: FloatingActionButtonThemeData(
+      backgroundColor: acc,
+      foregroundColor: Colors.white,
+      elevation: 4,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+    ),
+    dividerColor: dark ? Colors.white10 : Colors.black12,
   );
 }
 
@@ -1825,10 +2021,10 @@ class Pal {
     final acc = accents[Prefs.accent];
     return Pal(
       walls[Prefs.wall][dark ? 1 : 0],
-      dark ? Color.alphaBlend(acc.withOpacity(0.42), const Color(0xFF111B21)) : Color.alphaBlend(acc.withOpacity(0.2), Colors.white),
-      dark ? const Color(0xFF202C33) : Colors.white,
-      dark ? const Color(0xFFE9EDEF) : const Color(0xFF111B21),
-      dark ? const Color(0xFF8696A0) : const Color(0xFF667781),
+      dark ? Color.alphaBlend(acc.withOpacity(0.48), const Color(0xFF0B1F18)) : Color.alphaBlend(acc.withOpacity(0.22), const Color(0xFFF0FFF8)),
+      dark ? const Color(0xFF1A2730) : const Color(0xFFFFFFFF),
+      dark ? const Color(0xFFF2F5F7) : const Color(0xFF0B141A),
+      dark ? const Color(0xFF8B9CA6) : const Color(0xFF5B6B75),
       const Color(0xFF53BDEB),
     );
   }
@@ -2334,7 +2530,7 @@ class _HomeState extends State<HomeScreen> with WidgetsBindingObserver, SingleTi
       return Center(
           child: Padding(
         padding: const EdgeInsets.all(32),
-        child: Text(channels ? 'No channels yet.\nTap + to discover or create one.' : 'No chats yet.\nTap + to start a conversation.',
+        child: Text(channels ? 'No channels yet.\nTap + to discover or create one.' : 'Your chats live here.\nTap + to message someone, or open Artee AI from the menu.',
             textAlign: TextAlign.center),
       ));
     }
@@ -2687,13 +2883,20 @@ class _ChatState extends State<ChatScreen> {
   Map<String, Msg> byId = {};
   int limit = 50, members = 0;
   bool more = true, panel = false, hasText = false;
+  bool recording = false, recLock = false;
+  DateTime? recStarted;
+  Timer? _recTick;
+  int recSecs = 0;
   Msg? replyTo, editing;
   final ctl = TextEditingController();
   final focus = FocusNode();
   final scroll = ScrollController();
+  final AudioRecorder _rec = AudioRecorder();
+  String? _recPath;
   StreamSubscription<String>? sub;
 
   bool get canPost => chat.isAi || !chat.isChannel || chat.owner == Svc.me;
+  bool get canVoice => canPost && !chat.isAi && editing == null;
 
   @override
   void initState() {
@@ -2727,7 +2930,101 @@ class _ChatState extends State<ChatScreen> {
     ctl.dispose();
     focus.dispose();
     scroll.dispose();
+    _recTick?.cancel();
+    unawaited(_rec.dispose());
     super.dispose();
+  }
+
+  Future<bool> _ensureMic() async {
+    final st = await Permission.microphone.request();
+    if (!st.isGranted) {
+      if (mounted) toast(context, 'Microphone permission is required for voice messages.');
+      return false;
+    }
+    return true;
+  }
+
+  Future<void> startVoice() async {
+    if (!canVoice || recording || recLock) return;
+    if (!await _ensureMic()) return;
+    recLock = true;
+    try {
+      final dir = await getTemporaryDirectory();
+      final path = p.join(dir.path, 'voice_${DateTime.now().millisecondsSinceEpoch}.m4a');
+      if (await _rec.hasPermission()) {
+        await _rec.start(const RecordConfig(encoder: AudioEncoder.aacLc, bitRate: 96000, sampleRate: 44100), path: path);
+        _recPath = path;
+        recStarted = DateTime.now();
+        recSecs = 0;
+        _recTick?.cancel();
+        _recTick = Timer.periodic(const Duration(seconds: 1), (_) {
+          if (!mounted || !recording) return;
+          setState(() => recSecs = DateTime.now().difference(recStarted!).inSeconds);
+        });
+        if (mounted) setState(() => recording = true);
+        HapticFeedback.lightImpact();
+      }
+    } catch (e) {
+      DLog.d('voice', 'start: $e');
+      if (mounted) toast(context, 'Could not start recording.');
+    } finally {
+      recLock = false;
+    }
+  }
+
+  Future<void> cancelVoice() async {
+    _recTick?.cancel();
+    _recTick = null;
+    try {
+      await _rec.stop();
+    } catch (_) {}
+    final path = _recPath;
+    _recPath = null;
+    recStarted = null;
+    recSecs = 0;
+    if (path != null) {
+      try {
+        final f = File(path);
+        if (await f.exists()) await f.delete();
+      } catch (_) {}
+    }
+    if (mounted) setState(() => recording = false);
+  }
+
+  Future<void> stopVoiceAndSend() async {
+    if (!recording) return;
+    _recTick?.cancel();
+    _recTick = null;
+    String? path;
+    try {
+      path = await _rec.stop();
+    } catch (e) {
+      DLog.d('voice', 'stop: $e');
+    }
+    path ??= _recPath;
+    _recPath = null;
+    final started = recStarted;
+    recStarted = null;
+    recSecs = 0;
+    if (mounted) setState(() => recording = false);
+    if (path == null || !File(path).existsSync()) return;
+    final secs = started == null ? 1 : DateTime.now().difference(started).inSeconds.clamp(1, 600);
+    if (secs < 1) {
+      try {
+        await File(path).delete();
+      } catch (_) {}
+      return;
+    }
+    final r = replyTo;
+    if (mounted) setState(() => replyTo = null);
+    try {
+      await Svc.send(chat, kind: 'audio', localPath: path, name: 'voice.m4a', size: await File(path).length(), body: '$secs', replyTo: r?.id);
+      toBottom();
+      HapticFeedback.selectionClick();
+    } catch (e) {
+      DLog.d('voice', 'send: $e');
+      if (mounted) toast(context, 'Could not send voice message.');
+    }
   }
 
   Future<void> load() async {
@@ -2784,6 +3081,16 @@ class _ChatState extends State<ChatScreen> {
 
   void toBottom() {
     if (scroll.hasClients) scroll.jumpTo(0);
+  }
+
+  void _burstReact(BuildContext bubbleCtx) {
+    final box = bubbleCtx.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return;
+    final origin = box.localToGlobal(Offset(box.size.width / 2, box.size.height / 2));
+    final overlay = Overlay.of(context);
+    late OverlayEntry entry;
+    entry = OverlayEntry(builder: (_) => _HeartBurst(origin: origin, onDone: () => entry.remove()));
+    overlay.insert(entry);
   }
 
   Future<void> sendText() async {
@@ -3004,6 +3311,7 @@ class _ChatState extends State<ChatScreen> {
               reply: rep,
               replyName: rep == null ? null : (rep.mine ? 'You' : (profs[rep.sender]?.name ?? 'Member')),
               onLong: () => actions(m),
+              onReact: () => _burstReact(context),
             ),
           ),
         ),
@@ -3057,9 +3365,19 @@ class _ChatState extends State<ChatScreen> {
             child: msgs.isEmpty
                 ? Center(
                     child: Container(
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(color: pal.other, borderRadius: BorderRadius.circular(10)),
-                        child: Text(chat.isChannel ? 'No posts yet.' : 'No messages yet. Say hi 👋', style: TextStyle(color: pal.sub))))
+                        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+                        decoration: BoxDecoration(
+                          color: pal.other,
+                          borderRadius: BorderRadius.circular(16),
+                          boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.06), blurRadius: 12, offset: const Offset(0, 4))],
+                        ),
+                        child: Text(
+                          chat.isAi
+                              ? 'Ask Artee AI anything ✨'
+                              : (chat.isChannel ? 'No posts yet.' : 'No messages yet.\nHold the mic to send a voice note 🎤'),
+                          textAlign: TextAlign.center,
+                          style: TextStyle(color: pal.sub, height: 1.35),
+                        )))
                 : ListView.builder(
                     controller: scroll,
                     reverse: true,
@@ -3098,10 +3416,43 @@ class _ChatState extends State<ChatScreen> {
               else
                 Padding(
                   padding: const EdgeInsets.fromLTRB(6, 6, 6, 6),
-                  child: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                  child: recording
+                  ? Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                      decoration: BoxDecoration(
+                        color: pal.other,
+                        borderRadius: BorderRadius.circular(28),
+                        border: Border.all(color: Colors.redAccent.withOpacity(0.5)),
+                      ),
+                      child: Row(children: [
+                        Container(
+                          width: 12,
+                          height: 12,
+                          decoration: const BoxDecoration(color: Colors.redAccent, shape: BoxShape.circle),
+                        ),
+                        const SizedBox(width: 10),
+                        Text(
+                          '${recSecs ~/ 60}:${(recSecs % 60).toString().padLeft(2, '0')}',
+                          style: TextStyle(color: pal.text, fontWeight: FontWeight.w800, fontSize: 16, fontFeatures: const [ui.FontFeature.tabularFigures()]),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            'Release to send',
+                            style: TextStyle(color: pal.sub, fontWeight: FontWeight.w600),
+                          ),
+                        ),
+                        TextButton(onPressed: cancelVoice, child: const Text('Cancel')),
+                      ]),
+                    )
+                  : Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
                     Expanded(
                       child: Container(
-                        decoration: BoxDecoration(color: pal.other, borderRadius: BorderRadius.circular(24)),
+                        decoration: BoxDecoration(
+                          color: pal.other,
+                          borderRadius: BorderRadius.circular(28),
+                          boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.06), blurRadius: 8, offset: const Offset(0, 2))],
+                        ),
                         child: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
                           IconButton(
                             icon: Icon(panel ? Icons.keyboard : Icons.emoji_emotions_outlined, color: pal.sub),
@@ -3125,7 +3476,7 @@ class _ChatState extends State<ChatScreen> {
                                 maxLines: 6,
                                 keyboardType: TextInputType.multiline,
                                 textCapitalization: TextCapitalization.sentences,
-                                style: TextStyle(color: pal.text),
+                                style: TextStyle(color: pal.text, fontSize: 16),
                                 decoration: InputDecoration.collapsed(hintText: 'Message', hintStyle: TextStyle(color: pal.sub)),
                               ),
                             ),
@@ -3134,20 +3485,55 @@ class _ChatState extends State<ChatScreen> {
                         ]),
                       ),
                     ),
-                    const SizedBox(width: 6),
-                    CircleAvatar(
-                      radius: 24,
-                      backgroundColor: accents[Prefs.accent],
-                      child: IconButton(
-                        icon: Icon(editing != null ? Icons.check : Icons.send, color: Colors.white),
-                        onPressed: hasText ? sendText : null,
+                    const SizedBox(width: 8),
+                    // Send when typing; hold mic for voice when empty
+                    if (hasText || editing != null)
+                      Material(
+                        color: accents[Prefs.accent],
+                        shape: const CircleBorder(),
+                        elevation: 3,
+                        shadowColor: accents[Prefs.accent].withOpacity(0.5),
+                        child: InkWell(
+                          customBorder: const CircleBorder(),
+                          onTap: hasText || editing != null ? sendText : null,
+                          child: const SizedBox(
+                            width: 52,
+                            height: 52,
+                            child: Icon(Icons.send_rounded, color: Colors.white, size: 24),
+                          ),
+                        ),
+                      )
+                    else if (canVoice)
+                      GestureDetector(
+                        onLongPressStart: (_) => startVoice(),
+                        onLongPressEnd: (_) => stopVoiceAndSend(),
+                        onLongPressCancel: cancelVoice,
+                        child: Tooltip(
+                          message: 'Hold to record voice',
+                          child: Material(
+                            color: accents[Prefs.accent],
+                            shape: const CircleBorder(),
+                            elevation: 3,
+                            shadowColor: accents[Prefs.accent].withOpacity(0.5),
+                            child: const SizedBox(
+                              width: 52,
+                              height: 52,
+                              child: Icon(Icons.mic_rounded, color: Colors.white, size: 26),
+                            ),
+                          ),
+                        ),
+                      )
+                    else
+                      Material(
+                        color: accents[Prefs.accent].withOpacity(0.4),
+                        shape: const CircleBorder(),
+                        child: const SizedBox(width: 48, height: 48, child: Icon(Icons.send_rounded, color: Colors.white54, size: 22)),
                       ),
-                    ),
                   ]),
                 ),
               if (panel && canPost)
                 SizedBox(
-                  height: 290,
+                  height: 320,
                   child: MediaPanel(
                     onEmoji: insertText,
                     onSticker: (s) async {
@@ -3158,6 +3544,14 @@ class _ChatState extends State<ChatScreen> {
                     onGif: (u) async {
                       await Svc.send(chat, kind: 'gif', url: u, name: 'giphy.gif', replyTo: replyTo?.id);
                       if (mounted) setState(() => replyTo = null);
+                      toBottom();
+                    },
+                    onImageSticker: (path) async {
+                      await Svc.send(chat, kind: 'sticker', localPath: path, name: path.split('/').last, replyTo: replyTo?.id);
+                      if (mounted) setState(() {
+                        replyTo = null;
+                        panel = false;
+                      });
                       toBottom();
                     },
                   ),
@@ -3297,6 +3691,56 @@ class _LinkTextState extends State<LinkText> {
   }
 }
 
+
+class _HeartBurst extends StatefulWidget {
+  final Offset origin;
+  final VoidCallback onDone;
+  const _HeartBurst({required this.origin, required this.onDone});
+  @override
+  State<_HeartBurst> createState() => _HeartBurstState();
+}
+
+class _HeartBurstState extends State<_HeartBurst> with SingleTickerProviderStateMixin {
+  late final AnimationController c = AnimationController(vsync: this, duration: const Duration(milliseconds: 900))..forward();
+  @override
+  void initState() {
+    super.initState();
+    c.addStatusListener((s) {
+      if (s == AnimationStatus.completed) widget.onDone();
+    });
+  }
+  @override
+  void dispose() {
+    c.dispose();
+    super.dispose();
+  }
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: AnimatedBuilder(
+        animation: c,
+        builder: (_, __) {
+          final t = Curves.easeOut.transform(c.value);
+          return Stack(children: [
+            for (var i = 0; i < 7; i++)
+              Positioned(
+                left: widget.origin.dx - 12 + (i - 3) * 16.0 * t,
+                top: widget.origin.dy - 20 - 80 * t - (i % 3) * 10.0,
+                child: Opacity(
+                  opacity: (1 - t).clamp(0.0, 1.0),
+                  child: Transform.scale(
+                    scale: 0.6 + t * 0.8,
+                    child: Text(['❤️', '💕', '✨', '💖'][i % 4], style: TextStyle(fontSize: 18.0 + (i % 3) * 4)),
+                  ),
+                ),
+              ),
+          ]);
+        },
+      ),
+    );
+  }
+}
+
 class MsgBubble extends StatelessWidget {
   final Msg m;
   final ChatRow chat;
@@ -3304,7 +3748,8 @@ class MsgBubble extends StatelessWidget {
   final String? senderName, replyName;
   final Msg? reply;
   final VoidCallback onLong;
-  const MsgBubble({super.key, required this.m, required this.chat, required this.pal, this.senderName, this.reply, this.replyName, required this.onLong});
+  final VoidCallback? onReact;
+  const MsgBubble({super.key, required this.m, required this.chat, required this.pal, this.senderName, this.reply, this.replyName, required this.onLong, this.onReact});
 
   Widget footer() => Row(mainAxisSize: MainAxisSize.min, children: [
         if (m.pinned) Padding(padding: const EdgeInsets.only(right: 3), child: Icon(Icons.push_pin, size: 12, color: pal.sub)),
@@ -3330,7 +3775,10 @@ class MsgBubble extends StatelessWidget {
       case 'file':
         return Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [FileTile(m: m, pal: pal), cap]);
       case 'sticker':
-        return Text(m.body, style: const TextStyle(fontSize: 64));
+        if ((m.localPath != null && File(m.localPath!).existsSync()) || (m.mediaUrl != null && m.mediaUrl!.isNotEmpty)) {
+          return StickerImage(m: m);
+        }
+        return Text(m.body.isEmpty ? '⭐' : m.body, style: const TextStyle(fontSize: 72));
       default:
         return LinkText(text: m.body, style: txt, linkColor: pal.tick);
     }
@@ -3341,13 +3789,40 @@ class MsgBubble extends StatelessWidget {
     final maxW = MediaQuery.sizeOf(context).width * 0.78;
     final sticker = m.kind == 'sticker' && !m.delAll;
     final acc = accents[Prefs.accent];
+    final radius = m.mine
+        ? const BorderRadius.only(topLeft: Radius.circular(18), topRight: Radius.circular(18), bottomLeft: Radius.circular(18), bottomRight: Radius.circular(6))
+        : const BorderRadius.only(topLeft: Radius.circular(18), topRight: Radius.circular(18), bottomLeft: Radius.circular(6), bottomRight: Radius.circular(18));
     return GestureDetector(
       onLongPress: onLong,
+      onDoubleTap: onReact,
       child: ConstrainedBox(
         constraints: BoxConstraints(maxWidth: maxW),
         child: Container(
-          padding: sticker ? const EdgeInsets.symmetric(horizontal: 4) : const EdgeInsets.fromLTRB(9, 6, 9, 5),
-          decoration: sticker ? null : BoxDecoration(color: m.mine ? pal.mine : pal.other, borderRadius: BorderRadius.circular(12)),
+          padding: sticker ? const EdgeInsets.symmetric(horizontal: 4) : const EdgeInsets.fromLTRB(10, 7, 10, 6),
+          decoration: sticker
+              ? null
+              : BoxDecoration(
+                  gradient: m.mine
+                      ? LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [
+                            Color.alphaBlend(acc.withOpacity(0.35), pal.mine),
+                            pal.mine,
+                          ],
+                        )
+                      : null,
+                  color: m.mine ? null : pal.other,
+                  borderRadius: radius,
+                  border: m.mine ? null : Border.all(color: Colors.black.withOpacity(0.04)),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withOpacity(m.mine ? 0.12 : 0.06),
+                      blurRadius: m.mine ? 10 : 8,
+                      offset: const Offset(0, 3),
+                    ),
+                  ],
+                ),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
             if (senderName != null)
               Padding(padding: const EdgeInsets.only(bottom: 2), child: Text(senderName!, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: acc))),
@@ -3368,6 +3843,22 @@ class MsgBubble extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+class StickerImage extends StatelessWidget {
+  final Msg m;
+  const StickerImage({super.key, required this.m});
+  @override
+  Widget build(BuildContext context) {
+    final lp = m.localPath;
+    if (lp != null && File(lp).existsSync()) {
+      return Image.file(File(lp), width: 140, height: 140, fit: BoxFit.contain, errorBuilder: (_, __, ___) => const Text('⭐', style: TextStyle(fontSize: 64)));
+    }
+    if (m.mediaUrl != null && m.mediaUrl!.isNotEmpty) {
+      return CachedNetworkImage(imageUrl: m.mediaUrl!, width: 140, height: 140, fit: BoxFit.contain, errorWidget: (_, __, ___) => const Text('⭐', style: TextStyle(fontSize: 64)));
+    }
+    return Text(m.body.isEmpty ? '⭐' : m.body, style: const TextStyle(fontSize: 72));
   }
 }
 
@@ -3580,8 +4071,13 @@ class _AudioState extends State<AudioBubble> {
                 onChanged: c == null ? null : (x) => c!.seekTo(Duration(milliseconds: x.toInt())),
               ),
             ),
-            Text(c == null ? (widget.m.mediaName ?? 'Audio') : '${_t(v!.position)} / ${_t(v.duration)}',
-                maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 11, color: widget.pal.sub)),
+            Text(
+                c == null
+                    ? (int.tryParse(widget.m.body) != null ? '0:${two(int.parse(widget.m.body) % 60)} voice note' : (widget.m.mediaName ?? 'Voice note'))
+                    : '${_t(v!.position)} / ${_t(v.duration)}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 11, color: widget.pal.sub)),
           ]),
         ),
       ]),
@@ -3676,6 +4172,302 @@ class _PlayerState extends State<PlayerScreen> {
   }
 }
 
+// ───────────────────────── Sticker Studio (crop / pen / text) ─────────────────────────
+class StickerStudio extends StatefulWidget {
+  const StickerStudio({super.key});
+  @override
+  State<StickerStudio> createState() => _StickerStudioState();
+}
+
+class _Stroke {
+  final List<Offset> points;
+  final Color color;
+  final double width;
+  _Stroke(this.points, this.color, this.width);
+}
+
+class _TextItem {
+  String text;
+  Offset pos;
+  Color color;
+  double size;
+  _TextItem(this.text, this.pos, this.color, this.size);
+}
+
+class _StickerStudioState extends State<StickerStudio> {
+  ui.Image? _img;
+  String? _srcPath;
+  final strokes = <_Stroke>[];
+  _Stroke? cur;
+  final texts = <_TextItem>[];
+  Color penColor = Colors.white;
+  double penWidth = 4;
+  bool cropMode = false;
+  bool textMode = false;
+  Rect? crop; // relative 0-1 in image box
+  Offset? cropStart;
+  final boundaryKey = GlobalKey();
+  bool busy = false;
+  static const colors = [Colors.white, Colors.black, Colors.redAccent, Colors.amber, Colors.lightGreenAccent, Colors.cyanAccent, Colors.pinkAccent];
+
+  Future<void> _pick() async {
+    final x = await ImagePicker().pickImage(source: ImageSource.gallery, maxWidth: 1024, maxHeight: 1024, imageQuality: 92);
+    if (x == null) return;
+    final bytes = await File(x.path).readAsBytes();
+    final codec = await ui.instantiateImageCodec(bytes);
+    final frame = await codec.getNextFrame();
+    if (!mounted) return;
+    setState(() {
+      _img = frame.image;
+      _srcPath = x.path;
+      strokes.clear();
+      texts.clear();
+      crop = null;
+    });
+  }
+
+  Future<void> _save() async {
+    if (_img == null || busy) return;
+    setState(() => busy = true);
+    try {
+      await Future<void>.delayed(const Duration(milliseconds: 16));
+      final box = boundaryKey.currentContext?.findRenderObject() as RenderRepaintBoundary?;
+      if (box == null) throw 'render';
+      final image = await box.toImage(pixelRatio: 2);
+      final bd = await image.toByteData(format: ui.ImageByteFormat.png);
+      if (bd == null) throw 'encode';
+      final dir = await getApplicationDocumentsDirectory();
+      final dest = p.join(dir.path, 'stickers', 'stk_${DateTime.now().millisecondsSinceEpoch}.png');
+      await Directory(p.dirname(dest)).create(recursive: true);
+      await File(dest).writeAsBytes(bd.buffer.asUint8List());
+      final list = Prefs.customStickers.toList()..insert(0, dest);
+      while (list.length > 80) {
+        final old = list.removeLast();
+        try {
+          await File(old).delete();
+        } catch (_) {}
+      }
+      await Prefs.setCustomStickers(list);
+      if (mounted) {
+        toast(context, 'Sticker saved');
+        Navigator.pop(context, dest);
+      }
+    } catch (e) {
+      DLog.d('studio', '$e');
+      if (mounted) toast(context, 'Could not save sticker');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  void _addText() async {
+    final s = await askText(context, 'Sticker text', hint: 'Type something', maxLen: 40);
+    if (s == null || s.trim().isEmpty || !mounted) return;
+    setState(() {
+      texts.add(_TextItem(s.trim(), const Offset(40, 40), penColor, 28));
+      textMode = true;
+      cropMode = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final acc = accents[Prefs.accent];
+    return Scaffold(
+      backgroundColor: const Color(0xFF0E0E12),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF0E0E12),
+        foregroundColor: Colors.white,
+        title: const Text('Sticker Studio'),
+        actions: [
+          if (_img != null)
+            TextButton(
+              onPressed: busy ? null : _save,
+              child: busy
+                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                  : Text('Save', style: TextStyle(color: acc, fontWeight: FontWeight.w800)),
+            ),
+        ],
+      ),
+      body: Column(children: [
+        Expanded(
+          child: Center(
+            child: _img == null
+                ? Column(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(Icons.auto_awesome, size: 56, color: acc),
+                    const SizedBox(height: 12),
+                    const Text('Make a sticker', style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 8),
+                    const Text('Photo → draw, text, crop → save', style: TextStyle(color: Colors.white54)),
+                    const SizedBox(height: 20),
+                    FilledButton.icon(onPressed: _pick, icon: const Icon(Icons.add_photo_alternate), label: const Text('Choose photo')),
+                  ])
+                : LayoutBuilder(builder: (ctx, box) {
+                    final iw = _img!.width.toDouble();
+                    final ih = _img!.height.toDouble();
+                    final scale = (box.maxWidth / iw).clamp(0.0, box.maxHeight / ih);
+                    final w = iw * scale;
+                    final h = ih * scale;
+                    return InteractiveViewer(
+                      minScale: 0.8,
+                      maxScale: 4,
+                      child: SizedBox(
+                        width: w,
+                        height: h,
+                        child: RepaintBoundary(
+                          key: boundaryKey,
+                          child: GestureDetector(
+                            onPanStart: (d) {
+                              if (cropMode) {
+                                final rx = (d.localPosition.dx / w).clamp(0.0, 1.0);
+                                final ry = (d.localPosition.dy / h).clamp(0.0, 1.0);
+                                cropStart = Offset(rx, ry);
+                                setState(() => crop = Rect.fromPoints(cropStart!, cropStart!));
+                                return;
+                              }
+                              if (textMode) return;
+                              cur = _Stroke([d.localPosition], penColor, penWidth);
+                              setState(() => strokes.add(cur!));
+                            },
+                            onPanUpdate: (d) {
+                              if (cropMode && cropStart != null) {
+                                final rx = (d.localPosition.dx / w).clamp(0.0, 1.0);
+                                final ry = (d.localPosition.dy / h).clamp(0.0, 1.0);
+                                setState(() => crop = Rect.fromPoints(cropStart!, Offset(rx, ry)));
+                                return;
+                              }
+                              if (textMode && texts.isNotEmpty) {
+                                setState(() => texts.last.pos = d.localPosition);
+                                return;
+                              }
+                              if (cur == null) return;
+                              setState(() => cur!.points.add(d.localPosition));
+                            },
+                            onPanEnd: (_) {
+                              cur = null;
+                              cropStart = null;
+                            },
+                            child: Stack(children: [
+                              CustomPaint(
+                                size: Size(w, h),
+                                painter: _StudioPainter(image: _img!, strokes: strokes, texts: texts, crop: crop),
+                              ),
+                            ]),
+                          ),
+                        ),
+                      ),
+                    );
+                  }),
+          ),
+        ),
+        if (_img != null)
+          Container(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 16),
+            color: const Color(0xFF16161C),
+            child: Column(children: [
+              Row(children: [
+                for (final c in colors)
+                  GestureDetector(
+                    onTap: () => setState(() => penColor = c),
+                    child: Container(
+                      width: 28,
+                      height: 28,
+                      margin: const EdgeInsets.only(right: 8),
+                      decoration: BoxDecoration(
+                        color: c,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: penColor == c ? acc : Colors.white24, width: penColor == c ? 3 : 1),
+                      ),
+                    ),
+                  ),
+                const Spacer(),
+                IconButton(
+                  tooltip: 'Undo stroke',
+                  onPressed: strokes.isEmpty ? null : () => setState(() => strokes.removeLast()),
+                  icon: const Icon(Icons.undo, color: Colors.white70),
+                ),
+              ]),
+              const SizedBox(height: 6),
+              Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+                _tool(Icons.edit, 'Pen', !cropMode && !textMode, () => setState(() { cropMode = false; textMode = false; })),
+                _tool(Icons.text_fields, 'Text', textMode, _addText),
+                _tool(Icons.crop, 'Crop', cropMode, () => setState(() { cropMode = !cropMode; textMode = false; })),
+                _tool(Icons.photo_library_outlined, 'New', false, _pick),
+              ]),
+            ]),
+          ),
+      ]),
+    );
+  }
+
+  Widget _tool(IconData i, String label, bool on, VoidCallback fn) {
+    final acc = accents[Prefs.accent];
+    return InkWell(
+      onTap: fn,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        decoration: BoxDecoration(
+          color: on ? acc.withOpacity(0.25) : Colors.white10,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: on ? acc : Colors.transparent),
+        ),
+        child: Column(children: [
+          Icon(i, color: on ? acc : Colors.white70, size: 22),
+          const SizedBox(height: 4),
+          Text(label, style: TextStyle(color: on ? acc : Colors.white70, fontSize: 11, fontWeight: FontWeight.w600)),
+        ]),
+      ),
+    );
+  }
+}
+
+class _StudioPainter extends CustomPainter {
+  final ui.Image image;
+  final List<_Stroke> strokes;
+  final List<_TextItem> texts;
+  final Rect? crop;
+  _StudioPainter({required this.image, required this.strokes, required this.texts, this.crop});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    paintImage(canvas: canvas, rect: Offset.zero & size, image: image, fit: BoxFit.fill, filterQuality: FilterQuality.medium);
+    for (final s in strokes) {
+      if (s.points.isEmpty) continue;
+      final p = Paint()
+        ..color = s.color
+        ..strokeWidth = s.width
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round;
+      final path = Path()..moveTo(s.points.first.dx, s.points.first.dy);
+      for (var i = 1; i < s.points.length; i++) {
+        path.lineTo(s.points[i].dx, s.points[i].dy);
+      }
+      canvas.drawPath(path, p);
+    }
+    for (final t in texts) {
+      final tp = TextPainter(
+        text: TextSpan(text: t.text, style: TextStyle(color: t.color, fontSize: t.size, fontWeight: FontWeight.w800, shadows: const [Shadow(blurRadius: 4, color: Colors.black54)])),
+        textDirection: TextDirection.ltr,
+      )..layout(maxWidth: size.width);
+      tp.paint(canvas, t.pos);
+    }
+    if (crop != null) {
+      final r = Rect.fromLTRB(crop!.left * size.width, crop!.top * size.height, crop!.right * size.width, crop!.bottom * size.height).normalize();
+      canvas.drawPath(
+        Path.combine(ui.PathOperation.difference, Path()..addRect(Offset.zero & size), Path()..addRect(r)),
+        Paint()..color = Colors.black54,
+      );
+      canvas.drawRect(r, Paint()..color = Colors.white..style = PaintingStyle.stroke..strokeWidth = 2);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _StudioPainter old) => true;
+}
+
+
 // ───────────────────────── Emoji / sticker / GIF panel ─────────────────────────
 final List<String> kEmojis = ('😀 😃 😄 😁 😆 😅 😂 🤣 🙂 🙃 😉 😊 😇 🥰 😍 🤩 😘 😗 😚 😙 😋 😛 😜 🤪 😝 🤑 🤗 🤭 🤫 🤔 🤐 🤨 😐 😑 😶 😏 😒 🙄 😬 😌 😔 😪 🤤 😴 😷 🤒 🤕 🤢 🤮 🤧 🥵 🥶 🥴 😵 🤯 🤠 🥳 😎 🤓 🧐 😕 😟 🙁 😮 😯 😲 😳 🥺 😦 😧 😨 😰 😥 😢 😭 😱 😖 😣 😞 😓 😩 😫 🥱 😤 😡 😠 🤬 😈 👿 💀 💩 🤡 👹 👻 👽 👾 🤖 😺 😸 😹 😻 😼 😽 🙀 😿 😾 '
         '👋 🤚 ✋ 🖖 👌 🤏 ✌️ 🤞 🤟 🤘 🤙 👈 👉 👆 👇 ☝️ 👍 👎 ✊ 👊 🤛 🤜 👏 🙌 👐 🤲 🤝 🙏 💪 🧠 👀 👅 👄 '
@@ -3686,45 +4478,199 @@ final List<String> kEmojis = ('😀 😃 😄 😁 😆 😅 😂 🤣 🙂 🙃
 
 const List<String> kStickers = ['😂', '😍', '🥳', '😎', '🤯', '😭', '🙏', '👍', '🔥', '❤️', '💯', '🎉', '😴', '🤔', '🥺', '😡', '🤣', '😘', '🙌', '💪', '👀', '🤝', '😅', '🥰'];
 
-class MediaPanel extends StatelessWidget {
-  final ValueChanged<String> onEmoji, onSticker, onGif;
-  const MediaPanel({super.key, required this.onEmoji, required this.onSticker, required this.onGif});
+class MediaPanel extends StatefulWidget {
+  final void Function(String) onEmoji;
+  final void Function(String) onSticker;
+  final void Function(String) onGif;
+  final Future<void> Function(String path)? onImageSticker;
+  const MediaPanel({super.key, required this.onEmoji, required this.onSticker, required this.onGif, this.onImageSticker});
+  @override
+  State<MediaPanel> createState() => _MediaPanelState();
+}
+
+class _MediaPanelState extends State<MediaPanel> with SingleTickerProviderStateMixin {
+  late final TabController tc = TabController(length: 3, vsync: this);
+  List<String> gifs = [];
+  bool gifBusy = false;
+  final gifCtl = TextEditingController(text: 'funny');
+
+  @override
+  void dispose() {
+    tc.dispose();
+    gifCtl.dispose();
+    super.dispose();
+  }
+
+  Future<void> loadGifs([String? q]) async {
+    if (Cfg.giphyKey.isEmpty) return;
+    setState(() => gifBusy = true);
+    try {
+      final query = (q ?? gifCtl.text).trim().isEmpty ? 'funny' : gifCtl.text.trim();
+      final uri = Uri.parse('https://api.giphy.com/v1/gifs/search?api_key=${Cfg.giphyKey}&q=${Uri.encodeQueryComponent(query)}&limit=24&rating=pg-13');
+      final res = await http.get(uri).timeout(const Duration(seconds: 15));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body) as Map<String, dynamic>;
+        final list = data['data'] as List? ?? [];
+        gifs = [
+          for (final g in list)
+            if (g is Map && g['images'] is Map)
+              ((g['images'] as Map)['fixed_width'] as Map?)?['url'] as String? ?? ''
+        ].where((e) => e.isNotEmpty).toList();
+      }
+    } catch (e) {
+      DLog.d('giphy', '$e');
+    }
+    if (mounted) setState(() => gifBusy = false);
+  }
+
+  Future<void> _createSticker() async {
+    final path = await Navigator.of(context).push<String>(MaterialPageRoute(builder: (_) => const StickerStudio()));
+    if (path == null) return;
+    if (mounted) setState(() {});
+    if (widget.onImageSticker != null) await widget.onImageSticker!(path);
+  }
+
+  Future<void> _importSticker() async {
+    final r = await FilePicker.platform.pickFiles(type: FileType.image, allowMultiple: true);
+    if (r == null || r.files.isEmpty) return;
+    var n = 0;
+    for (final f in r.files) {
+      if (f.path == null) continue;
+      final path = await StickerStore.importFromPath(f.path!);
+      if (path != null) n++;
+    }
+    if (mounted) {
+      setState(() {});
+      toast(context, n == 0 ? 'No stickers imported' : 'Imported $n sticker${n == 1 ? '' : 's'}');
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    final pal = Pal.of(context);
-    return Container(
-      color: pal.other,
-      child: DefaultTabController(
-        length: 3,
-        child: Column(children: [
-          const TabBar(tabs: [
-            Tab(height: 40, icon: Icon(Icons.emoji_emotions_outlined, size: 20)),
-            Tab(height: 40, icon: Icon(Icons.sticky_note_2_outlined, size: 20)),
-            Tab(height: 40, text: 'GIF'),
-          ]),
-          Expanded(
-            child: TabBarView(children: [
-              GridView.builder(
-                padding: const EdgeInsets.all(6),
-                gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(maxCrossAxisExtent: 46),
-                itemCount: kEmojis.length,
-                itemBuilder: (c, i) => InkWell(onTap: () => onEmoji(kEmojis[i]), child: Center(child: Text(kEmojis[i], style: const TextStyle(fontSize: 26)))),
+    final acc = accents[Prefs.accent];
+    final custom = Prefs.customStickers.where((e) => File(e).existsSync()).toList();
+    return Material(
+      color: Theme.of(context).colorScheme.surface,
+      elevation: 8,
+      child: Column(children: [
+        TabBar(
+          controller: tc,
+          labelColor: acc,
+          indicatorColor: acc,
+          tabs: const [Tab(text: 'Emoji'), Tab(text: 'Stickers'), Tab(text: 'GIF')],
+          onTap: (i) {
+            if (i == 2 && gifs.isEmpty && !gifBusy) loadGifs();
+          },
+        ),
+        Expanded(
+          child: TabBarView(controller: tc, children: [
+            // Emoji
+            GridView.builder(
+              padding: const EdgeInsets.all(8),
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 8),
+              itemCount: kEmojis.length,
+              itemBuilder: (_, i) => InkWell(
+                onTap: () => widget.onEmoji(kEmojis[i]),
+                child: Center(child: Text(kEmojis[i], style: const TextStyle(fontSize: 26))),
               ),
-              GridView.builder(
-                padding: const EdgeInsets.all(8),
-                gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(maxCrossAxisExtent: 88),
-                itemCount: kStickers.length,
-                itemBuilder: (c, i) => InkWell(onTap: () => onSticker(kStickers[i]), child: Center(child: Text(kStickers[i], style: const TextStyle(fontSize: 48)))),
+            ),
+            // Stickers
+            Column(children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+                child: Row(children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: _createSticker,
+                      icon: const Icon(Icons.add_photo_alternate_outlined, size: 18),
+                      label: const Text('Create'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: _importSticker,
+                      icon: const Icon(Icons.folder_open, size: 18),
+                      label: const Text('Import'),
+                    ),
+                  ),
+                ]),
               ),
-              GifTab(onGif: onGif),
+              Expanded(
+                child: GridView.builder(
+                  padding: const EdgeInsets.all(10),
+                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 4, mainAxisSpacing: 8, crossAxisSpacing: 8),
+                  itemCount: custom.length + kStickers.length,
+                  itemBuilder: (_, i) {
+                    if (i < custom.length) {
+                      final path = custom[i];
+                      return InkWell(
+                        onTap: () async {
+                          if (widget.onImageSticker != null) await widget.onImageSticker!(path);
+                        },
+                        onLongPress: () async {
+                          await StickerStore.remove(path);
+                          if (mounted) setState(() {});
+                        },
+                        borderRadius: BorderRadius.circular(12),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: Image.file(File(path), fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.broken_image)),
+                        ),
+                      );
+                    }
+                    final s = kStickers[i - custom.length];
+                    return InkWell(
+                      onTap: () => widget.onSticker(s),
+                      borderRadius: BorderRadius.circular(12),
+                      child: Container(
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(color: Theme.of(context).colorScheme.surfaceContainerHighest, borderRadius: BorderRadius.circular(12)),
+                        child: Text(s, style: const TextStyle(fontSize: 40)),
+                      ),
+                    );
+                  },
+                ),
+              ),
             ]),
-          ),
-        ]),
-      ),
+            // GIF
+            Cfg.giphyKey.isEmpty
+                ? const Center(child: Padding(padding: EdgeInsets.all(24), child: Text('Add GIPHY_API_KEY secret and rebuild to enable GIFs.\nGet a free key at developers.giphy.com', textAlign: TextAlign.center)))
+                : Column(children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+                      child: TextField(
+                        controller: gifCtl,
+                        decoration: InputDecoration(
+                          hintText: 'Search GIPHY',
+                          isDense: true,
+                          border: const OutlineInputBorder(),
+                          suffixIcon: IconButton(icon: const Icon(Icons.search), onPressed: () => loadGifs()),
+                        ),
+                        onSubmitted: loadGifs,
+                      ),
+                    ),
+                    Expanded(
+                      child: gifBusy
+                          ? const Center(child: CircularProgressIndicator())
+                          : GridView.builder(
+                              padding: const EdgeInsets.all(8),
+                              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 3, mainAxisSpacing: 6, crossAxisSpacing: 6),
+                              itemCount: gifs.length,
+                              itemBuilder: (_, i) => InkWell(
+                                onTap: () => widget.onGif(gifs[i]),
+                                child: CachedNetworkImage(imageUrl: gifs[i], fit: BoxFit.cover, memCacheWidth: 200),
+                              ),
+                            ),
+                    ),
+                  ]),
+          ]),
+        ),
+      ]),
     );
   }
 }
+
 
 class GifTab extends StatefulWidget {
   final ValueChanged<String> onGif;
