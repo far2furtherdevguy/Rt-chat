@@ -291,29 +291,9 @@ jobs:
           for line in g.read_text().splitlines():
               if any(k in line for k in ("compileSdk", "targetSdk", "minSdk", "compileOptions", "desugar")):
                   print(line)
-          # Fix Kotlin-only subprojects missing com.android.library (android-plugin-fix)
-          root_gradle = root / "build.gradle"
-          if not root_gradle.exists():
-              root_gradle = root / "build.gradle.kts"
-          if root_gradle.exists():
-              gtxt = root_gradle.read_text()
-              if "android-plugin-fix" not in gtxt:
-                  snippet = "\n".join([
-                      "",
-                      "// android-plugin-fix",
-                      "subprojects {",
-                      "    afterEvaluate { p ->",
-                      "        if (p.plugins.hasPlugin(\"org.jetbrains.kotlin.android\") &&",
-                      "            !p.plugins.hasPlugin(\"com.android.application\") &&",
-                      "            !p.plugins.hasPlugin(\"com.android.library\")) {",
-                      "            p.plugins.apply(\"com.android.library\")",
-                      "        }",
-                      "    }",
-                      "}",
-                      "",
-                  ])
-                  root_gradle.write_text(gtxt + snippet)
-                  print("Applied android-plugin-fix to", root_gradle)
+          # NOTE: Do not inject Groovy "android-plugin-fix" into build.gradle.kts
+          # (Flutter uses Kotlin DSL; p.plugins.hasPlugin("...") fails to compile).
+          # Subproject compileSdk is already forced above.
 
           print("Android project patched successfully.")
           PY
