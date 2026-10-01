@@ -53,6 +53,8 @@ class Cfg {
   /// Optional comma-separated extra keys for rotation when free tier rate-limits.
   static const _openRouterKeysExtra = String.fromEnvironment('OPENROUTER_API_KEYS');
   static const _openRouterModel = String.fromEnvironment('OPENROUTER_MODEL', defaultValue: 'openrouter/free');
+  /// Optional comma-separated extra fallback models (secret OPENROUTER_FALLBACK_MODELS).
+  static const _openRouterFallbacks = String.fromEnvironment('OPENROUTER_FALLBACK_MODELS');
   static const maxUploadMb = int.fromEnvironment('MAX_UPLOAD_MB', defaultValue: 25);
   static const debugPassword = 'pass'; // dev debug log lock (not shown to users)
   static const editWindow = Duration(minutes: 15);
