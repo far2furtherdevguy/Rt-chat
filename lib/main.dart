@@ -16,7 +16,9 @@ import 'package:firebase_auth/firebase_auth.dart' as fb;
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/gestures.dart';
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -918,22 +920,33 @@ Tools:
   static int _keyIdx = 0;
   static int _modelIdx = 0;
 
-  /// Free models to try when the preferred one is rate-limited or missing.
-  static const fallbackModels = <String>[
+  /// Used only when primary model is a free tier id.
+  static const freeFallbackModels = <String>[
     'openrouter/free',
     'qwen/qwen3.8-27b:free',
-    'nvidia/nemotron-3-nano-30b-a3b:free',
     'meta-llama/llama-3.3-70b-instruct:free',
     'google/gemma-3-27b-it:free',
-    'mistralai/mistral-small-3.1-24b-instruct:free',
   ];
+
+  static bool _isFreeModel(String id) {
+    final m = id.toLowerCase();
+    return m.endsWith(':free') || m == 'openrouter/free' || m.endsWith('/free');
+  }
 
   static List<String> get _models {
     final pref = Cfg.openRouterModel;
     final list = <String>[];
     if (pref.isNotEmpty) list.add(pref);
-    for (final m in fallbackModels) {
-      if (!list.contains(m)) list.add(m);
+    // Extra fallbacks from secret OPENROUTER_FALLBACK_MODELS
+    for (final part in Cfg._openRouterFallbacks.split(RegExp(r'[,\s]+'))) {
+      final m = part.trim();
+      if (m.isNotEmpty && !list.contains(m)) list.add(m);
+    }
+    // Free-tier rotation only when primary is free (avoid burning free quota after a paid key works).
+    if (_isFreeModel(pref)) {
+      for (final m in freeFallbackModels) {
+        if (!list.contains(m)) list.add(m);
+      }
     }
     return list;
   }
@@ -1053,7 +1066,7 @@ Tools:
       }
     }
     if (lastErr is _HttpErr && lastErr.code == 429) {
-      throw 'Artee AI is rate-limited on free models. Wait a minute, or add more OPENROUTER_API_KEYS / a small OpenRouter credit.';
+      throw 'Artee AI hit a rate limit. Wait a bit, top up OpenRouter credits, or switch OPENROUTER_MODEL.';
     }
     throw lastErr ?? 'Artee AI could not reply.';
   }
@@ -1086,7 +1099,7 @@ Tools:
           useTools = false;
           data = await _chatRequestResilient(messages, withTools: false);
         } else if (e.code == 429) {
-          return 'Artee AI is rate-limited on free models. Wait a minute, or add more OPENROUTER_API_KEYS / a small OpenRouter credit.';
+          return 'Artee AI hit a rate limit. Wait a bit, top up OpenRouter credits, or switch OPENROUTER_MODEL.';
         } else {
           return 'Artee AI could not reply right now (${e.code}). Try again.';
         }
@@ -4454,7 +4467,13 @@ class _StudioPainter extends CustomPainter {
       tp.paint(canvas, t.pos);
     }
     if (crop != null) {
-      final r = Rect.fromLTRB(crop!.left * size.width, crop!.top * size.height, crop!.right * size.width, crop!.bottom * size.height).normalize();
+      final raw = Rect.fromLTRB(crop!.left * size.width, crop!.top * size.height, crop!.right * size.width, crop!.bottom * size.height);
+      final r = Rect.fromLTRB(
+        raw.left < raw.right ? raw.left : raw.right,
+        raw.top < raw.bottom ? raw.top : raw.bottom,
+        raw.left < raw.right ? raw.right : raw.left,
+        raw.top < raw.bottom ? raw.bottom : raw.top,
+      );
       canvas.drawPath(
         Path.combine(ui.PathOperation.difference, Path()..addRect(Offset.zero & size), Path()..addRect(r)),
         Paint()..color = Colors.black54,
