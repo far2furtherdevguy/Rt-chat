@@ -25,10 +25,6 @@ jobs:
       FIREBASE_SENDER_ID: ${{ secrets.FIREBASE_SENDER_ID }}
       GOOGLE_WEB_CLIENT_ID: ${{ secrets.GOOGLE_WEB_CLIENT_ID }}
       GIPHY_API_KEY: ${{ secrets.GIPHY_API_KEY }}
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      OPENROUTER_API_KEYS: ${{ secrets.OPENROUTER_API_KEYS }}
-      OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
-      OPENROUTER_FALLBACK_MODELS: ${{ secrets.OPENROUTER_FALLBACK_MODELS }}
       MAX_UPLOAD_MB: ${{ vars.MAX_UPLOAD_MB || '25' }}
       ANDROID_COMPILE_SDK: '36'
       ANDROID_TARGET_SDK: '36'
@@ -119,7 +115,7 @@ jobs:
           # Manifest: app name + permissions
           mf = root / "app/src/main/AndroidManifest.xml"
           s = mf.read_text()
-          s = re.sub(r'android:label="[^"]*"', 'android:label="RT Chat"', s, count=1)
+          s = re.sub(r'android:label="[^"]*"', 'android:label="RT-Chat"', s, count=1)
           perms = [
               "android.permission.INTERNET",
               "android.permission.POST_NOTIFICATIONS",
@@ -298,6 +294,97 @@ jobs:
           print("Android project patched successfully.")
           PY
 
+      - name: Generate app icon
+        continue-on-error: true
+        run: |
+          python3 -m pip install --quiet pillow || python3 -m pip install --quiet --break-system-packages pillow
+          cat > /tmp/make_icon.py << 'PYEOF'
+          import os, sys
+          from PIL import Image, ImageDraw
+
+          S = 1024  # supersampled master size
+          BG1, BG2 = (14, 128, 112), (9, 108, 93)   # teal green, matches the RT-Chat icon
+          DOT = (11, 114, 100)
+
+          def background(size):
+              img = Image.new("RGB", (size, size))
+              px = img.load()
+              for y in range(size):
+                  for x in range(size):
+                      t = (x + y) / (2.0 * (size - 1))
+                      px[x, y] = tuple(int(BG1[i] + (BG2[i] - BG1[i]) * t) for i in range(3))
+              return img
+
+          def bubble_shape(d, cx, cy, w, h, fill):
+              d.ellipse([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], fill=fill)
+              # tail, bottom-left
+              tx = cx - w * 0.30
+              ty = cy + h * 0.30
+              d.polygon([(tx - w * 0.10, ty), (tx + w * 0.20, ty + h * 0.12), (tx - w * 0.16, ty + h * 0.50)], fill=fill)
+
+          def glyph(size, scale):
+              """Soft halo bubble + solid white bubble + three dots, centred, `scale` = halo width / canvas."""
+              layer = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+              halo = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+              hw = size * scale
+              hh = hw * 0.92
+              cx, cy = size / 2, size / 2 - size * 0.02
+              bubble_shape(ImageDraw.Draw(halo), cx, cy, hw, hh, (255, 255, 255, 90))
+              layer.alpha_composite(halo)
+              d = ImageDraw.Draw(layer)
+              iw, ih = hw * 0.80, hh * 0.80
+              bubble_shape(d, cx + hw * 0.02, cy + hh * 0.01, iw, ih, (255, 255, 255, 255))
+              dr = iw * 0.055
+              for k in (-1, 0, 1):
+                  x = cx + hw * 0.02 + k * iw * 0.20
+                  y = cy + hh * 0.01
+                  d.ellipse([x - dr, y - dr, x + dr, y + dr], fill=DOT + (255,))
+              return layer
+
+          def main(res_dir):
+              bg = background(S)
+              full = bg.convert("RGBA")
+              full.alpha_composite(glyph(S, 0.66))
+              m = Image.new("L", (S, S), 0)
+              ImageDraw.Draw(m).rounded_rectangle([0, 0, S - 1, S - 1], radius=int(S * 0.22), fill=255)
+              full.putalpha(m)
+              fg = glyph(S, 0.50)  # stays inside the adaptive-icon safe zone
+              legacy = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+              adaptive = {"mdpi": 108, "hdpi": 162, "xhdpi": 216, "xxhdpi": 324, "xxxhdpi": 432}
+              rnd = bg.convert("RGBA")
+              rnd.alpha_composite(glyph(S, 0.62))
+              cm = Image.new("L", (S, S), 0)
+              ImageDraw.Draw(cm).ellipse([0, 0, S - 1, S - 1], fill=255)
+              rnd.putalpha(cm)
+              for dname, px in legacy.items():
+                  out = os.path.join(res_dir, "mipmap-" + dname)
+                  os.makedirs(out, exist_ok=True)
+                  full.resize((px, px), Image.LANCZOS).save(os.path.join(out, "ic_launcher.png"))
+                  rnd.resize((px, px), Image.LANCZOS).save(os.path.join(out, "ic_launcher_round.png"))
+              for dname, px in adaptive.items():
+                  out = os.path.join(res_dir, "mipmap-" + dname)
+                  fg.resize((px, px), Image.LANCZOS).save(os.path.join(out, "ic_launcher_foreground.png"))
+                  bg.resize((px, px), Image.LANCZOS).save(os.path.join(out, "ic_launcher_background.png"))
+              any_dir = os.path.join(res_dir, "mipmap-anydpi-v26")
+              os.makedirs(any_dir, exist_ok=True)
+              xml = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                     '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                     '    <background android:drawable="@mipmap/ic_launcher_background"/>\n'
+                     '    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n'
+                     '</adaptive-icon>\n')
+              for name in ("ic_launcher.xml", "ic_launcher_round.xml"):
+                  open(os.path.join(any_dir, name), "w").write(xml)
+              full.resize((512, 512), Image.LANCZOS).save(os.path.join(res_dir, "icon_preview_512.png"))
+              print("Icon generated in", res_dir)
+
+          if __name__ == "__main__":
+              main(sys.argv[1])
+          PYEOF
+          python3 /tmp/make_icon.py android/app/src/main/res
+          rm -f android/app/src/main/res/icon_preview_512.png
+          # drop any stale default launcher icons that could shadow ours
+          find android/app/src/main/res -name 'ic_launcher.webp' -delete || true
+
       - name: Get packages
         run: flutter pub get
 
@@ -313,10 +400,6 @@ jobs:
               --dart-define=FIREBASE_SENDER_ID="$FIREBASE_SENDER_ID" \
               --dart-define=GOOGLE_WEB_CLIENT_ID="$GOOGLE_WEB_CLIENT_ID" \
               --dart-define=GIPHY_API_KEY="$GIPHY_API_KEY" \
-              --dart-define=OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
-              --dart-define=OPENROUTER_API_KEYS="$OPENROUTER_API_KEYS" \
-              --dart-define=OPENROUTER_MODEL="${OPENROUTER_MODEL:-openrouter/free}" \
-              --dart-define=OPENROUTER_FALLBACK_MODELS="$OPENROUTER_FALLBACK_MODELS" \
               --dart-define=MAX_UPLOAD_MB="$MAX_UPLOAD_MB"; then
               break
             fi
