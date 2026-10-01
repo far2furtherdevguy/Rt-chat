@@ -23,7 +23,7 @@ dependencies:
   cryptography: ^2.7.0
   flutter_secure_storage: ^9.2.2
   # Notifications (inline reply)
-  flutter_local_notifications: ^17.2.3
+  flutter_local_notifications: ^18.0.0
   # Media
   image_picker: ^1.1.2
   file_picker: ^8.1.2
