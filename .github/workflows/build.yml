@@ -298,36 +298,21 @@ jobs:
           if root_gradle.exists():
               gtxt = root_gradle.read_text()
               if "android-plugin-fix" not in gtxt:
-                  if root_gradle.suffix == ".kts":
-                      gtxt += """
-
-// android-plugin-fix
-subprojects {
-    afterEvaluate {
-        val p = this
-        if (p.plugins.hasPlugin("org.jetbrains.kotlin.android")
-            && !p.plugins.hasPlugin("com.android.application")
-            && !p.plugins.hasPlugin("com.android.library")) {
-            p.plugins.apply("com.android.library")
-        }
-    }
-}
-"""
-                  else:
-                      gtxt += """
-
-// android-plugin-fix
-subprojects {
-    afterEvaluate { p ->
-        if (p.plugins.hasPlugin("org.jetbrains.kotlin.android") &&
-            !p.plugins.hasPlugin("com.android.application") &&
-            !p.plugins.hasPlugin("com.android.library")) {
-            p.plugins.apply("com.android.library")
-        }
-    }
-}
-"""
-                  root_gradle.write_text(gtxt)
+                  snippet = "\n".join([
+                      "",
+                      "// android-plugin-fix",
+                      "subprojects {",
+                      "    afterEvaluate { p ->",
+                      "        if (p.plugins.hasPlugin(\"org.jetbrains.kotlin.android\") &&",
+                      "            !p.plugins.hasPlugin(\"com.android.application\") &&",
+                      "            !p.plugins.hasPlugin(\"com.android.library\")) {",
+                      "            p.plugins.apply(\"com.android.library\")",
+                      "        }",
+                      "    }",
+                      "}",
+                      "",
+                  ])
+                  root_gradle.write_text(gtxt + snippet)
                   print("Applied android-plugin-fix to", root_gradle)
 
           print("Android project patched successfully.")
