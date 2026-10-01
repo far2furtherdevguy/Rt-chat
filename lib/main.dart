@@ -39,7 +39,7 @@ import 'package:video_player/video_player.dart';
 // ───────────────────────── Config ─────────────────────────
 class Cfg {
   static const appName = 'RT Chat';
-  static const version = '1.1.0';
+  static const version = '1.2.0';
   // Raw env values (may contain accidental whitespace from secrets UI).
   static const _supabaseUrl = String.fromEnvironment('SUPABASE_URL');
   static const _supabaseAnon = String.fromEnvironment('SUPABASE_ANON_KEY');
@@ -49,12 +49,6 @@ class Cfg {
   static const _fbSender = String.fromEnvironment('FIREBASE_SENDER_ID');
   static const _webClientId = String.fromEnvironment('GOOGLE_WEB_CLIENT_ID');
   static const _giphyKey = String.fromEnvironment('GIPHY_API_KEY');
-  static const _openRouterKey = String.fromEnvironment('OPENROUTER_API_KEY');
-  /// Optional comma-separated extra keys for rotation when free tier rate-limits.
-  static const _openRouterKeysExtra = String.fromEnvironment('OPENROUTER_API_KEYS');
-  static const _openRouterModel = String.fromEnvironment('OPENROUTER_MODEL', defaultValue: 'openrouter/free');
-  /// Optional comma-separated extra fallback models (secret OPENROUTER_FALLBACK_MODELS).
-  static const _openRouterFallbacks = String.fromEnvironment('OPENROUTER_FALLBACK_MODELS');
   static const maxUploadMb = int.fromEnvironment('MAX_UPLOAD_MB', defaultValue: 25);
   static const debugPassword = 'pass'; // dev debug log lock (not shown to users)
   static const editWindow = Duration(minutes: 15);
@@ -70,26 +64,6 @@ class Cfg {
   static String get fbSender => _fbSender.trim();
   static String get webClientId => _webClientId.trim();
   static String get giphyKey => _giphyKey.trim();
-  static String get openRouterKey => _openRouterKey.trim();
-  static String get openRouterModel =>
-      _openRouterModel.trim().isEmpty ? 'openrouter/free' : _openRouterModel.trim();
-
-  /// Primary key + optional extras (comma/newline/space separated).
-  static List<String> get openRouterKeys {
-    final raw = '$_openRouterKey,$_openRouterKeysExtra';
-    final seen = <String>{};
-    final out = <String>[];
-    for (final part in raw.split(RegExp(r'[,\s]+'))) {
-      final k = part.trim();
-      if (k.isEmpty || seen.contains(k)) continue;
-      seen.add(k);
-      out.add(k);
-    }
-    return out;
-  }
-
-  static bool get arteeEnabled => openRouterKeys.isNotEmpty;
-
   /// Supabase is required. Firebase is optional (Google sign-in not required).
   static bool get configured => supabaseUrl.isNotEmpty && supabaseAnon.isNotEmpty;
   static bool get firebaseConfigured =>
@@ -175,8 +149,12 @@ const accents = <Color>[
   Color(0xFFEF4444),
   Color(0xFFF59E0B),
   Color(0xFFEC4899),
+  Color(0xFF14B8A6),
+  Color(0xFFF97316),
+  Color(0xFF6366F1),
+  Color(0xFF64748B),
 ];
-const accentNames = ['Green', 'Blue', 'Purple', 'Red', 'Amber', 'Pink'];
+const accentNames = ['Green', 'Blue', 'Purple', 'Red', 'Amber', 'Pink', 'Teal', 'Orange', 'Indigo', 'Slate'];
 // [light, dark] chat backgrounds
 const walls = <List<Color>>[
   [Color(0xFFEFEAE2), Color(0xFF0B141A)],
@@ -184,8 +162,9 @@ const walls = <List<Color>>[
   [Color(0xFFF3E5F5), Color(0xFF1A1024)],
   [Color(0xFFE8F5E9), Color(0xFF0F1F14)],
   [Color(0xFFFFFFFF), Color(0xFF000000)],
+  [Color(0xFFE5E9EE), Color(0xFF111827)],
 ];
-const wallNames = ['Sand', 'Sky', 'Lilac', 'Mint', 'Plain'];
+const wallNames = ['Sand', 'Sky', 'Lilac', 'Mint', 'Plain', 'Slate'];
 
 class Prefs {
   static late SharedPreferences sp;
@@ -194,6 +173,16 @@ class Prefs {
   static int get accent => (sp.getInt('accent') ?? 0).clamp(0, accents.length - 1).toInt();
   static int get wall => (sp.getInt('wall') ?? 0).clamp(0, walls.length - 1).toInt();
   static bool get lowData => sp.getBool('low_data') ?? false;
+  static double get radius => (sp.getDouble('bub_radius') ?? 18.0).clamp(6.0, 28.0).toDouble();
+  static double get textSize => (sp.getDouble('msg_size') ?? 16.0).clamp(13.0, 22.0).toDouble();
+  static bool get amoled => sp.getBool('amoled') ?? false;
+  static bool get flat => sp.getBool('flat_bubbles') ?? false;
+  static bool get motion => sp.getBool('motion') ?? true;
+  static Future<void> setDouble(String k, double v) async {
+    await sp.setDouble(k, v);
+    rev.value++;
+  }
+
   static List<String> get customStickers => List<String>.from(sp.getStringList('custom_stickers') ?? const <String>[]);
   static Future<void> setCustomStickers(List<String> paths) async {
     await sp.setStringList('custom_stickers', paths);
@@ -333,7 +322,6 @@ String previewOf(Msg m) {
 }
 
 String chatTitle(ChatRow c, Map<String, Profile> pm) {
-  if (c.isAi) return 'Artee AI';
   if (c.isDirect) return pm[c.peer]?.name ?? 'Chat';
   return c.name.isEmpty ? 'Chat' : c.name;
 }
@@ -581,8 +569,6 @@ class Db {
     }
     final out = [for (final r in rows) ChatItem(ChatRow.row(r), last[r['last_id']], _i(r['unread']))];
     out.sort((a, b) {
-      if (a.chat.isAi && !b.chat.isAi) return -1;
-      if (!a.chat.isAi && b.chat.isAi) return 1;
       return (b.last?.ts ?? b.chat.created).compareTo(a.last?.ts ?? a.chat.created);
     });
     return out;
@@ -758,451 +744,6 @@ class Notif {
 }
 
 final GlobalKey<NavigatorState> navKey = GlobalKey<NavigatorState>();
-
-// ───────────────────────── Artee AI (OpenRouter + free web search) ─────────────────────────
-/// Built-in assistant in RT Chat. Free OpenRouter model + client-side web search tool.
-/// Always presents as Artee AI (never Grok / underlying model names).
-class ArteeAi {
-  static const chatId = 'artee-ai';
-  static const senderId = 'artee-ai';
-
-  static const systemPrompt = """
-You are Artee AI, the built-in assistant inside the RT Chat messaging app.
-
-Identity rules (never break these):
-- Your name is Artee AI. Never say you are Grok, ChatGPT, Claude, Gemini, Llama, Qwen, or any other model.
-- Never mention OpenRouter, xAI, providers, or the underlying model name.
-- If asked who you are: "I'm Artee AI, the assistant built into RT Chat."
-
-Style:
-- Helpful, friendly, clear, lightly witty - like a smart friend in the chat.
-- Concise unless the user asks for depth.
-
-Tools:
-- You have a web_search tool. Use it when the user needs current facts, news, prices, scores, "today", "latest", or anything that may change.
-- Do not invent live data. If search returns nothing useful, say so.
-- After search results arrive, answer in plain language. You may briefly cite sources by name/URL.
-- You can also help with writing, ideas, explanations, study, and RT Chat tips without searching.
-""";
-
-  /// OpenAI-style tool the free model can call; we execute search on-device (no OpenRouter search fee).
-  static final List<Map<String, dynamic>> tools = [
-    {
-      'type': 'function',
-      'function': {
-        'name': 'web_search',
-        'description':
-            'Search the public web for current information. Use for news, facts, prices, sports, weather, or anything time-sensitive.',
-        'parameters': {
-          'type': 'object',
-          'properties': {
-            'query': {
-              'type': 'string',
-              'description': 'Short search query, e.g. "Nigeria election results 2026"',
-            },
-          },
-          'required': ['query'],
-        },
-      },
-    },
-  ];
-
-  static ChatRow chatRow() => ChatRow(
-        id: chatId,
-        kind: 'ai',
-        name: 'Artee AI',
-        owner: Svc.me,
-        created: nowMs(),
-      );
-
-  static Future<void> ensureChat() async {
-    final existing = await Db.chat(chatId);
-    if (existing != null) return;
-    await Db.putChat(chatRow());
-    Db.bump('*');
-  }
-
-  static String _scrub(String text) {
-    return text
-        .replaceAll(RegExp(r'\bI am Grok\b', caseSensitive: false), 'I am Artee AI')
-        .replaceAll(RegExp(r"\bI'm Grok\b", caseSensitive: false), "I'm Artee AI")
-        .replaceAll(RegExp(r'\bGrok\b'), 'Artee AI')
-        .replaceAll(RegExp(r'\bChatGPT\b'), 'Artee AI')
-        .replaceAll(RegExp(r'\bClaude\b'), 'Artee AI');
-  }
-
-  /// Free web search via DuckDuckGo Instant Answer API (no API key, no OpenRouter search cost).
-  static Future<String> webSearch(String query) async {
-    final q = query.trim();
-    if (q.isEmpty) return 'Empty query.';
-    try {
-      final uri = Uri.https('api.duckduckgo.com', '/', {
-        'q': q,
-        'format': 'json',
-        'no_html': '1',
-        'skip_disambig': '1',
-      });
-      final res = await http.get(uri, headers: {'User-Agent': 'RTChat-ArteeAI/1.0'}).timeout(const Duration(seconds: 20));
-      if (res.statusCode != 200) return 'Search failed (${res.statusCode}).';
-      final data = jsonDecode(res.body) as Map<String, dynamic>;
-      final buf = StringBuffer();
-      final heading = (data['Heading'] as String?)?.trim() ?? '';
-      final abs = (data['AbstractText'] as String?)?.trim() ?? '';
-      final absUrl = (data['AbstractURL'] as String?)?.trim() ?? '';
-      final answer = (data['Answer'] as String?)?.trim() ?? '';
-      final def = (data['Definition'] as String?)?.trim() ?? '';
-      if (heading.isNotEmpty) buf.writeln('Topic: $heading');
-      if (answer.isNotEmpty) buf.writeln('Answer: $answer');
-      if (abs.isNotEmpty) {
-        buf.writeln('Summary: $abs');
-        if (absUrl.isNotEmpty) buf.writeln('Source: $absUrl');
-      }
-      if (def.isNotEmpty) buf.writeln('Definition: $def');
-      final related = data['RelatedTopics'];
-      if (related is List) {
-        var n = 0;
-        for (final item in related) {
-          if (n >= 6) break;
-          if (item is Map) {
-            final text = (item['Text'] as String?)?.trim() ?? '';
-            final url = (item['FirstURL'] as String?)?.trim() ?? '';
-            if (text.isEmpty) continue;
-            n++;
-            buf.writeln('- $text${url.isNotEmpty ? ' ($url)' : ''}');
-          }
-        }
-      }
-      final results = data['Results'];
-      if (results is List) {
-        for (final item in results.take(4)) {
-          if (item is Map) {
-            final text = (item['Text'] as String?)?.trim() ?? '';
-            final url = (item['FirstURL'] as String?)?.trim() ?? '';
-            if (text.isNotEmpty) buf.writeln('- $text${url.isNotEmpty ? ' ($url)' : ''}');
-          }
-        }
-      }
-      final out = buf.toString().trim();
-      if (out.isEmpty) return await _wikiSearch(q);
-      return out;
-    } catch (e) {
-      DLog.d('artee-search', '$e');
-      try {
-        return await _wikiSearch(q);
-      } catch (e2) {
-        return 'Search unavailable: $e2';
-      }
-    }
-  }
-
-  static Future<String> _wikiSearch(String q) async {
-    final uri = Uri.https('en.wikipedia.org', '/w/api.php', {
-      'action': 'query',
-      'list': 'search',
-      'srsearch': q,
-      'srlimit': '5',
-      'format': 'json',
-      'utf8': '1',
-    });
-    final res = await http.get(uri, headers: {'User-Agent': 'RTChat-ArteeAI/1.0'}).timeout(const Duration(seconds: 15));
-    if (res.statusCode != 200) return 'No search results.';
-    final data = jsonDecode(res.body) as Map<String, dynamic>;
-    final search = (data['query'] as Map?)?['search'] as List? ?? [];
-    if (search.isEmpty) return 'No results found for "$q".';
-    final buf = StringBuffer('Wikipedia results for "$q":\n');
-    for (final item in search) {
-      if (item is! Map) continue;
-      final title = item['title'] ?? '';
-      final snippet = (item['snippet'] as String? ?? '').replaceAll(RegExp(r'<[^>]+>'), '');
-      buf.writeln('- $title: $snippet');
-    }
-    return buf.toString();
-  }
-
-  static int _keyIdx = 0;
-  static int _modelIdx = 0;
-
-  /// Used only when primary model is a free tier id.
-  static const freeFallbackModels = <String>[
-    'openrouter/free',
-    'qwen/qwen3.8-27b:free',
-    'meta-llama/llama-3.3-70b-instruct:free',
-    'google/gemma-3-27b-it:free',
-  ];
-
-  static bool _isFreeModel(String id) {
-    final m = id.toLowerCase();
-    return m.endsWith(':free') || m == 'openrouter/free' || m.endsWith('/free');
-  }
-
-  static List<String> get _models {
-    final pref = Cfg.openRouterModel;
-    final list = <String>[];
-    if (pref.isNotEmpty) list.add(pref);
-    // Extra fallbacks from secret OPENROUTER_FALLBACK_MODELS
-    for (final part in Cfg._openRouterFallbacks.split(RegExp(r'[,\s]+'))) {
-      final m = part.trim();
-      if (m.isNotEmpty && !list.contains(m)) list.add(m);
-    }
-    // Free-tier rotation only when primary is free (avoid burning free quota after a paid key works).
-    if (_isFreeModel(pref)) {
-      for (final m in freeFallbackModels) {
-        if (!list.contains(m)) list.add(m);
-      }
-    }
-    return list;
-  }
-
-  static String get _currentKey {
-    final keys = Cfg.openRouterKeys;
-    if (keys.isEmpty) return '';
-    return keys[_keyIdx % keys.length];
-  }
-
-  static String get _currentModel {
-    final models = _models;
-    return models[_modelIdx % models.length];
-  }
-
-  static void _rotateKey() {
-    final keys = Cfg.openRouterKeys;
-    if (keys.length <= 1) return;
-    _keyIdx = (_keyIdx + 1) % keys.length;
-    DLog.d('artee', 'rotated API key -> index $_keyIdx');
-  }
-
-  static void _rotateModel() {
-    final models = _models;
-    if (models.length <= 1) return;
-    _modelIdx = (_modelIdx + 1) % models.length;
-    DLog.d('artee', 'rotated model -> ${_currentModel}');
-  }
-
-  static Future<Map<String, dynamic>> _chatRequest(
-    List<Map<String, dynamic>> messages, {
-    bool withTools = true,
-    String? model,
-    String? apiKey,
-  }) async {
-    final key = apiKey ?? _currentKey;
-    final mod = model ?? _currentModel;
-    final body = <String, dynamic>{
-      'model': mod,
-      'messages': messages,
-      'temperature': 0.7,
-      'max_tokens': 1200,
-    };
-    if (withTools) {
-      body['tools'] = tools;
-      body['tool_choice'] = 'auto';
-    }
-    final res = await http
-        .post(
-          Uri.parse('https://openrouter.ai/api/v1/chat/completions'),
-          headers: {
-            'Authorization': 'Bearer $key',
-            'Content-Type': 'application/json',
-            'HTTP-Referer': 'https://rtchat.app',
-            'X-Title': 'RT Chat Artee AI',
-          },
-          body: jsonEncode(body),
-        )
-        .timeout(const Duration(seconds: 90));
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      DLog.d('artee', 'HTTP ${res.statusCode} model=$mod: ${res.body}');
-      final low = res.body.toLowerCase();
-      if (res.statusCode == 401) throw 'Artee AI key is invalid. Check OPENROUTER_API_KEY.';
-      if (res.statusCode == 402 || low.contains('credit')) {
-        throw 'OpenRouter needs credits for this model. Use a :free model id.';
-      }
-      throw _HttpErr(res.statusCode, res.body);
-    }
-    return jsonDecode(res.body) as Map<String, dynamic>;
-  }
-
-  /// Retries across keys and free models on 429 / model errors.
-  static Future<Map<String, dynamic>> _chatRequestResilient(
-    List<Map<String, dynamic>> messages, {
-    bool withTools = true,
-  }) async {
-    final keys = Cfg.openRouterKeys;
-    final models = _models;
-    final attempts = (keys.isEmpty ? 1 : keys.length) * models.length;
-    Object? lastErr;
-
-    for (var i = 0; i < attempts; i++) {
-      try {
-        return await _chatRequest(messages, withTools: withTools);
-      } on _HttpErr catch (e) {
-        lastErr = e;
-        final retryable = e.code == 429 || e.code == 503 || e.code == 502 ||
-            e.code == 404 || e.code == 400;
-        if (!retryable) rethrow;
-
-        // 429: rotate key first, then model; short backoff.
-        if (e.code == 429) {
-          if (keys.length > 1) {
-            _rotateKey();
-          } else {
-            _rotateModel();
-          }
-          // After trying all keys once on this model, also rotate model.
-          if (keys.length > 1 && (i + 1) % keys.length == 0) {
-            _rotateModel();
-          }
-          await Future<void>.delayed(Duration(milliseconds: 400 + 200 * i));
-          continue;
-        }
-        // Bad model / tools unsupported: drop tools or rotate model.
-        if (e.code == 400 || e.code == 404) {
-          if (withTools && (e.body.contains('tool') || e.body.contains('model'))) {
-            // Caller may retry without tools; signal via special code.
-            rethrow;
-          }
-          _rotateModel();
-          await Future<void>.delayed(const Duration(milliseconds: 300));
-          continue;
-        }
-        _rotateModel();
-        await Future<void>.delayed(const Duration(milliseconds: 300));
-      }
-    }
-    if (lastErr is _HttpErr && lastErr.code == 429) {
-      throw 'Artee AI hit a rate limit. Wait a bit, top up OpenRouter credits, or switch OPENROUTER_MODEL.';
-    }
-    throw lastErr ?? 'Artee AI could not reply.';
-  }
-
-  static Future<String> complete(List<Msg> history, String userText) async {
-    if (!Cfg.arteeEnabled) {
-      return 'Artee AI is not set up yet. Add the OPENROUTER_API_KEY GitHub secret and rebuild the app.';
-    }
-    final recent = history.reversed.take(20).toList().reversed.toList();
-    final messages = <Map<String, dynamic>>[
-      {'role': 'system', 'content': systemPrompt.trim()},
-    ];
-    for (final m in recent) {
-      if (m.delAll || m.body.isEmpty || m.kind != 'text') continue;
-      final role = m.sender == senderId ? 'assistant' : 'user';
-      messages.add({'role': role, 'content': m.body});
-    }
-    if (messages.isEmpty || messages.last['role'] != 'user' || messages.last['content'] != userText) {
-      messages.add({'role': 'user', 'content': userText});
-    }
-
-    const maxRounds = 3;
-    var useTools = true;
-    for (var round = 0; round < maxRounds; round++) {
-      Map<String, dynamic> data;
-      try {
-        data = await _chatRequestResilient(messages, withTools: useTools);
-      } on _HttpErr catch (e) {
-        if (useTools && (e.code == 400 || e.code == 404 || e.body.contains('tool'))) {
-          useTools = false;
-          data = await _chatRequestResilient(messages, withTools: false);
-        } else if (e.code == 429) {
-          return 'Artee AI hit a rate limit. Wait a bit, top up OpenRouter credits, or switch OPENROUTER_MODEL.';
-        } else {
-          return 'Artee AI could not reply right now (${e.code}). Try again.';
-        }
-      } catch (e) {
-        return e.toString();
-      }
-
-      final choices = data['choices'] as List?;
-      if (choices == null || choices.isEmpty) return 'Artee AI sent an empty reply.';
-      final msg = choices.first['message'] as Map<String, dynamic>? ?? {};
-      final toolCalls = msg['tool_calls'] as List?;
-
-      if (toolCalls == null || toolCalls.isEmpty) {
-        var text = (msg['content'] as String?)?.trim() ?? '';
-        if (text.isEmpty) return 'Artee AI sent an empty reply.';
-        return _scrub(text);
-      }
-
-      messages.add(msg);
-      for (final call in toolCalls) {
-        if (call is! Map) continue;
-        final id = call['id']?.toString() ?? 'call_$round';
-        final fn = call['function'] as Map? ?? {};
-        final name = fn['name']?.toString() ?? '';
-        var argsRaw = fn['arguments']?.toString() ?? '{}';
-        Map<String, dynamic> args = {};
-        try {
-          args = jsonDecode(argsRaw) as Map<String, dynamic>;
-        } catch (_) {}
-        String result;
-        if (name == 'web_search') {
-          final q = (args['query'] ?? userText).toString();
-          result = await webSearch(q);
-        } else {
-          result = 'Unknown tool: $name';
-        }
-        messages.add({
-          'role': 'tool',
-          'tool_call_id': id,
-          'content': result,
-        });
-      }
-    }
-    return 'Artee AI took too long searching. Try a shorter question.';
-  }
-
-  static Future<void> sendUserMessage(String text) async {
-    await ensureChat();
-    final id = Svc.newId();
-    final ts = nowMs();
-    final user = Msg(
-      id: id,
-      chatId: chatId,
-      sender: Svc.me,
-      kind: 'text',
-      body: text,
-      ts: ts,
-      status: 3,
-      pending: false,
-    );
-    await Db.putMsg(user);
-    Db.bump(chatId);
-
-    final aid = Svc.newId();
-    final thinking = Msg(
-      id: aid,
-      chatId: chatId,
-      sender: senderId,
-      kind: 'text',
-      body: '...',
-      ts: ts + 1,
-      status: 3,
-      pending: true,
-    );
-    await Db.putMsg(thinking);
-    Db.bump(chatId);
-
-    try {
-      final hist = await Db.messages(chatId, 40);
-      final ctx = [for (final m in hist) if (m.id != aid) m];
-      final reply = await complete(ctx, text);
-      await Db.d.update('msgs', {'body': reply, 'pending': 0}, where: 'id=?', whereArgs: [aid]);
-      Db.bump(chatId);
-    } catch (e) {
-      DLog.d('artee', '$e');
-      await Db.d.update('msgs', {
-        'body': '$e',
-        'pending': 0,
-      }, where: 'id=?', whereArgs: [aid]);
-      Db.bump(chatId);
-    }
-  }
-}
-
-class _HttpErr implements Exception {
-  final int code;
-  final String body;
-  _HttpErr(this.code, this.body);
-  @override
-  String toString() => 'HTTP $code';
-}
 
 // ───────────────────────── Service layer ─────────────────────────
 class Svc {
@@ -1871,11 +1412,6 @@ class Svc {
     ];
   }
 
-  static Future<ChatRow> openArtee() async {
-    await ArteeAi.ensureChat();
-    return (await Db.chat(ArteeAi.chatId)) ?? ArteeAi.chatRow();
-  }
-
   static Future<ChatRow> openDirect(Profile peer) async {
     final ids = [me, peer.uid]..sort();
     final id = 'd_${ids[0]}_${ids[1]}';
@@ -1993,36 +1529,44 @@ class Boot {
 ThemeData buildTheme(Brightness b) {
   final acc = accents[Prefs.accent];
   final dark = b == Brightness.dark;
-  final cs = ColorScheme.fromSeed(
-    seedColor: acc,
-    brightness: b,
-    surface: dark ? const Color(0xFF0B141A) : const Color(0xFFF7F8FA),
-  );
+  final bg = dark
+      ? (Prefs.amoled ? const Color(0xFF000000) : Color.alphaBlend(acc.withOpacity(0.05), const Color(0xFF0B141A)))
+      : Color.alphaBlend(acc.withOpacity(0.04), const Color(0xFFF4F5F7));
+  final bar = dark
+      ? (Prefs.amoled ? const Color(0xFF0A0A0A) : Color.alphaBlend(acc.withOpacity(0.08), const Color(0xFF1A242D)))
+      : Colors.white;
+  final cs = ColorScheme.fromSeed(seedColor: acc, brightness: b, surface: bg);
   return ThemeData(
     useMaterial3: true,
     colorScheme: cs,
-    scaffoldBackgroundColor: dark ? const Color(0xFF0B141A) : const Color(0xFFF0F2F5),
-    splashFactory: InkRipple.splashFactory,
+    scaffoldBackgroundColor: bg,
+    splashFactory: InkSparkle.splashFactory,
+    visualDensity: VisualDensity.standard,
     pageTransitionsTheme: const PageTransitionsTheme(builders: {
       TargetPlatform.android: CupertinoPageTransitionsBuilder(),
+      TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
     }),
     appBarTheme: AppBarTheme(
-      backgroundColor: dark ? const Color(0xFF1A242D) : Colors.white,
+      backgroundColor: bar,
+      surfaceTintColor: Colors.transparent,
       foregroundColor: dark ? Colors.white : const Color(0xFF111B21),
       elevation: 0,
-      scrolledUnderElevation: 0.8,
+      scrolledUnderElevation: 0.6,
       centerTitle: false,
       titleTextStyle: TextStyle(
-        fontSize: 18,
+        fontSize: 19,
         fontWeight: FontWeight.w700,
+        letterSpacing: -0.2,
         color: dark ? Colors.white : const Color(0xFF111B21),
       ),
     ),
+    popupMenuTheme: PopupMenuThemeData(shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14))),
+    snackBarTheme: SnackBarThemeData(behavior: SnackBarBehavior.floating, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
     floatingActionButtonTheme: FloatingActionButtonThemeData(
       backgroundColor: acc,
       foregroundColor: Colors.white,
-      elevation: 4,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      elevation: 3,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
     ),
     dividerColor: dark ? Colors.white10 : Colors.black12,
   );
@@ -2034,13 +1578,20 @@ class Pal {
   static Pal of(BuildContext c) {
     final dark = Theme.of(c).brightness == Brightness.dark;
     final acc = accents[Prefs.accent];
+    final hsl = HSLColor.fromColor(acc);
+    final mine = dark
+        ? hsl.withLightness(0.25).withSaturation((hsl.saturation * 0.85).clamp(0.0, 1.0).toDouble()).toColor()
+        : hsl.withLightness(0.89).withSaturation(hsl.saturation.clamp(0.0, 1.0).toDouble()).toColor();
+    final other = dark
+        ? (Prefs.amoled ? const Color(0xFF141414) : Color.alphaBlend(acc.withOpacity(0.06), const Color(0xFF1A2730)))
+        : const Color(0xFFFFFFFF);
     return Pal(
-      walls[Prefs.wall][dark ? 1 : 0],
-      dark ? Color.alphaBlend(acc.withOpacity(0.48), const Color(0xFF0B1F18)) : Color.alphaBlend(acc.withOpacity(0.22), const Color(0xFFF0FFF8)),
-      dark ? const Color(0xFF1A2730) : const Color(0xFFFFFFFF),
+      dark && Prefs.amoled ? const Color(0xFF000000) : walls[Prefs.wall][dark ? 1 : 0],
+      mine,
+      other,
       dark ? const Color(0xFFF2F5F7) : const Color(0xFF0B141A),
       dark ? const Color(0xFF8B9CA6) : const Color(0xFF5B6B75),
-      const Color(0xFF53BDEB),
+      dark ? const Color(0xFF6CC6F2) : const Color(0xFF1B7FB8),
     );
   }
 }
@@ -2088,11 +1639,17 @@ class Splash extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Scaffold(
         body: Center(
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Icon(Icons.chat_bubble, size: 64, color: accents[Prefs.accent]),
-            const SizedBox(height: 12),
-            const Text(Cfg.appName, style: TextStyle(fontSize: 26, fontWeight: FontWeight.w700)),
-          ]),
+          child: TweenAnimationBuilder<double>(
+            tween: Tween(begin: 0.0, end: 1.0),
+            duration: const Duration(milliseconds: 600),
+            curve: Curves.easeOutCubic,
+            builder: (_, v, child) => Opacity(opacity: v, child: Transform.scale(scale: 0.85 + 0.15 * v, child: child)),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Icon(Icons.chat_bubble_rounded, size: 64, color: accents[Prefs.accent]),
+              const SizedBox(height: 12),
+              const Text(Cfg.appName, style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800, letterSpacing: -0.4)),
+            ]),
+          ),
         ),
       );
 }
@@ -2506,7 +2063,6 @@ class _HomeState extends State<HomeScreen> with WidgetsBindingObserver, SingleTi
       if (!tc.indexIsChanging) setState(() {});
     });
     sub = Db.changes.listen((_) => load());
-    unawaited(ArteeAi.ensureChat());
     load();
     Svc.begin().whenComplete(() {
       if (mounted) setState(() => syncing = false);
@@ -2540,12 +2096,12 @@ class _HomeState extends State<HomeScreen> with WidgetsBindingObserver, SingleTi
   }
 
   Widget list(bool channels) {
-    final l = items.where((e) => e.chat.isChannel == channels).toList();
+    final l = items.where((e) => !e.chat.isAi && e.chat.isChannel == channels).toList();
     if (l.isEmpty) {
       return Center(
           child: Padding(
         padding: const EdgeInsets.all(32),
-        child: Text(channels ? 'No channels yet.\nTap + to discover or create one.' : 'Your chats live here.\nTap + to message someone, or open Artee AI from the menu.',
+        child: Text(channels ? 'No channels yet.\nTap + to discover or create one.' : 'Your chats live here.\nTap + to message someone.',
             textAlign: TextAlign.center),
       ));
     }
@@ -2565,21 +2121,23 @@ class _HomeState extends State<HomeScreen> with WidgetsBindingObserver, SingleTi
         actions: [
           PopupMenuButton<String>(
             onSelected: (v) async {
-              if (v == 'artee') {
-                final c = await Svc.openArtee();
-                if (context.mounted) Navigator.push(context, MaterialPageRoute(builder: (_) => ChatScreen(chat: c)));
-              }
               if (v == 'group') Navigator.push(context, MaterialPageRoute(builder: (_) => const UserSearchScreen(group: true)));
               if (v == 'settings') Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsScreen()));
             },
             itemBuilder: (_) => const [
-              PopupMenuItem(value: 'artee', child: Text('Artee AI')),
               PopupMenuItem(value: 'group', child: Text('New group')),
               PopupMenuItem(value: 'settings', child: Text('Settings')),
             ],
           ),
         ],
-        bottom: TabBar(controller: tc, tabs: const [Tab(text: 'Chats'), Tab(text: 'Channels')]),
+        bottom: TabBar(
+          controller: tc,
+          indicatorColor: acc,
+          labelColor: acc,
+          dividerColor: Colors.transparent,
+          labelStyle: const TextStyle(fontWeight: FontWeight.w700),
+          tabs: const [Tab(text: 'Chats'), Tab(text: 'Channels')],
+        ),
       ),
       body: Column(children: [
         if (syncing) const LinearProgressIndicator(minHeight: 2),
@@ -2590,7 +2148,11 @@ class _HomeState extends State<HomeScreen> with WidgetsBindingObserver, SingleTi
             context,
             MaterialPageRoute(
                 builder: (_) => tc.index == 0 ? const UserSearchScreen(group: false) : const ChannelsScreen())),
-        child: Icon(tc.index == 0 ? Icons.chat : Icons.campaign),
+        child: AnimatedSwitcher(
+          duration: const Duration(milliseconds: 220),
+          transitionBuilder: (w, a) => ScaleTransition(scale: a, child: FadeTransition(opacity: a, child: w)),
+          child: Icon(tc.index == 0 ? Icons.chat_rounded : Icons.campaign_rounded, key: ValueKey<int>(tc.index)),
+        ),
       ),
     );
   }
@@ -2612,7 +2174,7 @@ class ChatTile extends StatelessWidget {
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16),
         child: Row(children: [
-          Avatar(url: chatPhoto(c, pm), name: title, r: 26, icon: c.isAi ? Icons.auto_awesome : (c.isChannel ? Icons.campaign : (c.isGroup ? Icons.groups : null))),
+          Avatar(url: chatPhoto(c, pm), name: title, r: 26, icon: c.isChannel ? Icons.campaign : (c.isGroup ? Icons.groups : null)),
           const SizedBox(width: 14),
           Expanded(
             child: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -2910,8 +2472,8 @@ class _ChatState extends State<ChatScreen> {
   String? _recPath;
   StreamSubscription<String>? sub;
 
-  bool get canPost => chat.isAi || !chat.isChannel || chat.owner == Svc.me;
-  bool get canVoice => canPost && !chat.isAi && editing == null;
+  bool get canPost => !chat.isChannel || chat.owner == Svc.me;
+  bool get canVoice => canPost && editing == null;
 
   @override
   void initState() {
@@ -3126,11 +2688,7 @@ class _ChatState extends State<ChatScreen> {
     final r = replyTo;
     ctl.clear();
     setState(() => replyTo = null);
-    if (chat.isAi) {
-      await ArteeAi.sendUserMessage(t);
-    } else {
-      await Svc.send(chat, body: t, replyTo: r?.id);
-    }
+    await Svc.send(chat, body: t, replyTo: r?.id);
     toBottom();
   }
 
@@ -3303,6 +2861,9 @@ class _ChatState extends State<ChatScreen> {
     final older = i + 1 < msgs.length ? msgs[i + 1] : null;
     final showDay = older == null || !sameDay(older.ts, m.ts);
     final firstOfRun = older == null || showDay || older.sender != m.sender;
+    final newer = i > 0 ? msgs[i - 1] : null;
+    final lastOfRun = newer == null || newer.sender != m.sender || !sameDay(newer.ts, m.ts);
+    final fresh = Prefs.motion && DateTime.now().millisecondsSinceEpoch - m.ts < 2500;
     final rep = m.replyTo == null ? null : byId[m.replyTo];
     return Column(key: ValueKey(m.id), children: [
       if (showDay)
@@ -3317,16 +2878,21 @@ class _ChatState extends State<ChatScreen> {
         child: Align(
           alignment: m.mine ? Alignment.centerRight : Alignment.centerLeft,
           child: Padding(
-            padding: EdgeInsets.fromLTRB(10, firstOfRun ? 6 : 1, 10, 1),
-            child: MsgBubble(
+            padding: EdgeInsets.fromLTRB(10, firstOfRun ? 8 : 2, 10, 1),
+            child: _PopIn(
+              enabled: fresh,
+              fromRight: m.mine,
+              child: MsgBubble(
               m: m,
               chat: chat,
               pal: pal,
+              tail: lastOfRun,
               senderName: chat.isGroup && !m.mine && firstOfRun ? (profs[m.sender]?.name ?? 'Member') : null,
               reply: rep,
               replyName: rep == null ? null : (rep.mine ? 'You' : (profs[rep.sender]?.name ?? 'Member')),
               onLong: () => actions(m),
               onReact: () => _burstReact(context),
+            ),
             ),
           ),
         ),
@@ -3352,7 +2918,7 @@ class _ChatState extends State<ChatScreen> {
           title: InkWell(
             onTap: info,
             child: Row(children: [
-              Avatar(url: chatPhoto(chat, profs), name: title, r: 19, icon: chat.isAi ? Icons.auto_awesome : (chat.isChannel ? Icons.campaign : (chat.isGroup ? Icons.groups : null))),
+              Avatar(url: chatPhoto(chat, profs), name: title, r: 19, icon: chat.isChannel ? Icons.campaign : (chat.isGroup ? Icons.groups : null)),
               const SizedBox(width: 10),
               Expanded(
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisAlignment: MainAxisAlignment.center, children: [
@@ -3387,9 +2953,7 @@ class _ChatState extends State<ChatScreen> {
                           boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.06), blurRadius: 12, offset: const Offset(0, 4))],
                         ),
                         child: Text(
-                          chat.isAi
-                              ? 'Ask Artee AI anything ✨'
-                              : (chat.isChannel ? 'No posts yet.' : 'No messages yet.\nHold the mic to send a voice note 🎤'),
+                          chat.isChannel ? 'No posts yet.' : 'No messages yet.\nSay hi 👋',
                           textAlign: TextAlign.center,
                           style: TextStyle(color: pal.sub, height: 1.35),
                         )))
@@ -3502,8 +3066,13 @@ class _ChatState extends State<ChatScreen> {
                     ),
                     const SizedBox(width: 8),
                     // Send when typing; hold mic for voice when empty
-                    if (hasText || editing != null)
-                      Material(
+                    AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 180),
+                      transitionBuilder: (w, a) => ScaleTransition(scale: a, child: FadeTransition(opacity: a, child: w)),
+                      child: KeyedSubtree(
+                        key: ValueKey<int>((hasText || editing != null) ? 1 : (canVoice ? 2 : 3)),
+                        child: (hasText || editing != null)
+                      ? Material(
                         color: accents[Prefs.accent],
                         shape: const CircleBorder(),
                         elevation: 3,
@@ -3518,8 +3087,8 @@ class _ChatState extends State<ChatScreen> {
                           ),
                         ),
                       )
-                    else if (canVoice)
-                      GestureDetector(
+                      : canVoice
+                      ? GestureDetector(
                         onLongPressStart: (_) => startVoice(),
                         onLongPressEnd: (_) => stopVoiceAndSend(),
                         onLongPressCancel: cancelVoice,
@@ -3538,12 +3107,13 @@ class _ChatState extends State<ChatScreen> {
                           ),
                         ),
                       )
-                    else
-                      Material(
+                      : Material(
                         color: accents[Prefs.accent].withOpacity(0.4),
                         shape: const CircleBorder(),
                         child: const SizedBox(width: 48, height: 48, child: Icon(Icons.send_rounded, color: Colors.white54, size: 22)),
                       ),
+                      ),
+                    ),
                   ]),
                 ),
               if (panel && canPost)
@@ -3655,7 +3225,8 @@ class LinkText extends StatefulWidget {
   final String text;
   final TextStyle style;
   final Color linkColor;
-  const LinkText({super.key, required this.text, required this.style, required this.linkColor});
+  final double padEnd;
+  const LinkText({super.key, required this.text, required this.style, required this.linkColor, this.padEnd = 0});
   @override
   State<LinkText> createState() => _LinkTextState();
 }
@@ -3702,6 +3273,9 @@ class _LinkTextState extends State<LinkText> {
       last = m.start + u.length;
     }
     if (last < t.length) spans.add(TextSpan(text: t.substring(last)));
+    if (widget.padEnd > 0) {
+      spans.add(WidgetSpan(alignment: PlaceholderAlignment.bottom, child: SizedBox(width: widget.padEnd, height: 14)));
+    }
     return Text.rich(TextSpan(style: widget.style, children: spans));
   }
 }
@@ -3764,7 +3338,17 @@ class MsgBubble extends StatelessWidget {
   final Msg? reply;
   final VoidCallback onLong;
   final VoidCallback? onReact;
-  const MsgBubble({super.key, required this.m, required this.chat, required this.pal, this.senderName, this.reply, this.replyName, required this.onLong, this.onReact});
+  final bool tail;
+  const MsgBubble({super.key, required this.m, required this.chat, required this.pal, this.senderName, this.reply, this.replyName, required this.onLong, this.onReact, this.tail = true});
+
+  /// Approximate width of the time/ticks footer so text can wrap around it.
+  double metaWidth() {
+    var w = 46.0;
+    if (m.pinned) w += 15;
+    if (m.edited && !m.delAll) w += 40;
+    if (m.mine && !chat.isChannel && !m.delAll) w += 19;
+    return w + 4;
+  }
 
   Widget footer() => Row(mainAxisSize: MainAxisSize.min, children: [
         if (m.pinned) Padding(padding: const EdgeInsets.only(right: 3), child: Icon(Icons.push_pin, size: 12, color: pal.sub)),
@@ -3773,8 +3357,8 @@ class MsgBubble extends StatelessWidget {
         if (m.mine && !chat.isChannel && !m.delAll) ...[const SizedBox(width: 3), Ticks(m: m, size: 15)],
       ]);
 
-  Widget content(BuildContext context) {
-    final txt = TextStyle(fontSize: 16, color: pal.text);
+  Widget content(BuildContext context, [double padEnd = 0]) {
+    final txt = TextStyle(fontSize: Prefs.textSize, height: 1.28, color: pal.text);
     if (m.delAll) return Text('🚫 This message was deleted', style: TextStyle(fontSize: 15, fontStyle: FontStyle.italic, color: pal.sub));
     final cap = m.body.isNotEmpty && m.kind != 'text' && m.kind != 'sticker'
         ? Padding(padding: const EdgeInsets.only(top: 4), child: LinkText(text: m.body, style: txt, linkColor: pal.tick))
@@ -3795,18 +3379,22 @@ class MsgBubble extends StatelessWidget {
         }
         return Text(m.body.isEmpty ? '⭐' : m.body, style: const TextStyle(fontSize: 72));
       default:
-        return LinkText(text: m.body, style: txt, linkColor: pal.tick);
+        return LinkText(text: m.body, style: txt, linkColor: pal.tick, padEnd: padEnd);
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final maxW = MediaQuery.sizeOf(context).width * 0.78;
+    final maxW = MediaQuery.sizeOf(context).width * 0.8;
     final sticker = m.kind == 'sticker' && !m.delAll;
+    final inline = !m.delAll && !sticker && m.kind == 'text';
     final acc = accents[Prefs.accent];
+    final r = Radius.circular(Prefs.radius);
+    final small = Radius.circular(tail ? math.max(3.0, Prefs.radius * 0.28) : Prefs.radius);
     final radius = m.mine
-        ? const BorderRadius.only(topLeft: Radius.circular(18), topRight: Radius.circular(18), bottomLeft: Radius.circular(18), bottomRight: Radius.circular(6))
-        : const BorderRadius.only(topLeft: Radius.circular(18), topRight: Radius.circular(18), bottomLeft: Radius.circular(6), bottomRight: Radius.circular(18));
+        ? BorderRadius.only(topLeft: r, topRight: r, bottomLeft: r, bottomRight: small)
+        : BorderRadius.only(topLeft: r, topRight: r, bottomLeft: small, bottomRight: r);
+    final flat = Prefs.flat;
     return GestureDetector(
       onLongPress: onLong,
       onDoubleTap: onReact,
@@ -3817,7 +3405,7 @@ class MsgBubble extends StatelessWidget {
           decoration: sticker
               ? null
               : BoxDecoration(
-                  gradient: m.mine
+                  gradient: m.mine && !flat
                       ? LinearGradient(
                           begin: Alignment.topLeft,
                           end: Alignment.bottomRight,
@@ -3827,16 +3415,18 @@ class MsgBubble extends StatelessWidget {
                           ],
                         )
                       : null,
-                  color: m.mine ? null : pal.other,
+                  color: (m.mine && !flat) ? null : (m.mine ? pal.mine : pal.other),
                   borderRadius: radius,
-                  border: m.mine ? null : Border.all(color: Colors.black.withOpacity(0.04)),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withOpacity(m.mine ? 0.12 : 0.06),
-                      blurRadius: m.mine ? 10 : 8,
-                      offset: const Offset(0, 3),
-                    ),
-                  ],
+                  border: (m.mine || flat) ? null : Border.all(color: Colors.black.withOpacity(0.04)),
+                  boxShadow: flat
+                      ? null
+                      : [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(m.mine ? 0.10 : 0.05),
+                            blurRadius: m.mine ? 8 : 6,
+                            offset: const Offset(0, 2),
+                          ),
+                        ],
                 ),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
             if (senderName != null)
@@ -3851,12 +3441,82 @@ class MsgBubble extends StatelessWidget {
                   Text(reply == null ? 'Original message' : previewOf(reply!), maxLines: 2, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 13, color: pal.sub)),
                 ]),
               ),
-            content(context),
-            const SizedBox(height: 2),
-            Align(alignment: Alignment.centerRight, child: footer()),
+            if (inline)
+              Stack(clipBehavior: Clip.none, children: [
+                content(context, metaWidth()),
+                Positioned(right: 0, bottom: 0, child: footer()),
+              ])
+            else ...[
+              content(context),
+              const SizedBox(height: 2),
+              Align(alignment: Alignment.centerRight, child: footer()),
+            ],
           ]),
         ),
       ),
+    );
+  }
+}
+
+/// Short fade + slide + scale used when a new message appears.
+class _PopIn extends StatelessWidget {
+  final Widget child;
+  final bool enabled, fromRight;
+  const _PopIn({required this.child, required this.enabled, required this.fromRight});
+  @override
+  Widget build(BuildContext context) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: enabled ? 0.0 : 1.0, end: 1.0),
+      duration: Duration(milliseconds: enabled ? 260 : 0),
+      curve: Curves.easeOutCubic,
+      builder: (_, v, c) => Opacity(
+        opacity: v,
+        child: Transform.translate(
+          offset: Offset((fromRight ? 18.0 : -18.0) * (1 - v), 10.0 * (1 - v)),
+          child: Transform.scale(scale: 0.94 + 0.06 * v, alignment: fromRight ? Alignment.bottomRight : Alignment.bottomLeft, child: c),
+        ),
+      ),
+      child: child,
+    );
+  }
+}
+
+class _BubblePreview extends StatelessWidget {
+  const _BubblePreview();
+  @override
+  Widget build(BuildContext context) {
+    final pal = Pal.of(context);
+    final acc = accents[Prefs.accent];
+    final r = Radius.circular(Prefs.radius);
+    final small = Radius.circular(math.max(3.0, Prefs.radius * 0.28));
+    Widget bubble(String t, bool mine) => Align(
+          alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 160),
+            margin: const EdgeInsets.symmetric(vertical: 3),
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+            decoration: BoxDecoration(
+              gradient: mine && !Prefs.flat
+                  ? LinearGradient(begin: Alignment.topLeft, end: Alignment.bottomRight, colors: [Color.alphaBlend(acc.withOpacity(0.35), pal.mine), pal.mine])
+                  : null,
+              color: (mine && !Prefs.flat) ? null : (mine ? pal.mine : pal.other),
+              borderRadius: mine
+                  ? BorderRadius.only(topLeft: r, topRight: r, bottomLeft: r, bottomRight: small)
+                  : BorderRadius.only(topLeft: r, topRight: r, bottomLeft: small, bottomRight: r),
+              boxShadow: Prefs.flat ? null : [BoxShadow(color: Colors.black.withOpacity(0.08), blurRadius: 6, offset: const Offset(0, 2))],
+            ),
+            child: Text(t, style: TextStyle(fontSize: Prefs.textSize, height: 1.28, color: pal.text)),
+          ),
+        );
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 200),
+      margin: const EdgeInsets.symmetric(horizontal: 16),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(color: pal.wall, borderRadius: BorderRadius.circular(16)),
+      child: Column(children: [
+        bubble('Hey! How does this look?', false),
+        bubble('Sharp. Smooth. Mine. ✨', true),
+      ]),
     );
   }
 }
@@ -4827,6 +4487,24 @@ class _SettingsState extends State<SettingsScreen> {
         child: Text(t, style: TextStyle(fontWeight: FontWeight.w700, color: accents[Prefs.accent])),
       );
 
+  Widget _slider(String label, double v, double min, double max, String key) => Padding(
+        padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+        child: Row(children: [
+          SizedBox(width: 140, child: Text(label)),
+          Expanded(
+            child: Slider(
+              value: v.clamp(min, max).toDouble(),
+              min: min,
+              max: max,
+              onChanged: (x) async {
+                await Prefs.setDouble(key, x);
+                if (mounted) setState(() {});
+              },
+            ),
+          ),
+        ]),
+      );
+
   @override
   Widget build(BuildContext context) {
     final pr = me;
@@ -4867,7 +4545,7 @@ class _SettingsState extends State<SettingsScreen> {
         const Padding(padding: EdgeInsets.fromLTRB(16, 16, 16, 6), child: Text('Accent colour')),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 12),
-          child: Wrap(spacing: 10, children: [
+          child: Wrap(spacing: 10, runSpacing: 10, children: [
             for (var i = 0; i < accents.length; i++)
               GestureDetector(
                 onTap: () async {
@@ -4908,6 +4586,37 @@ class _SettingsState extends State<SettingsScreen> {
                 ),
               ),
           ]),
+        ),
+        const Padding(padding: EdgeInsets.fromLTRB(16, 20, 16, 8), child: Text('Preview')),
+        const _BubblePreview(),
+        _slider('Bubble roundness', Prefs.radius, 6, 28, 'bub_radius'),
+        _slider('Message text size', Prefs.textSize, 13, 22, 'msg_size'),
+        SwitchListTile(
+          title: const Text('Pure black dark mode'),
+          subtitle: const Text('True black backgrounds for OLED screens (dark mode).'),
+          value: Prefs.amoled,
+          onChanged: (v) async {
+            await Prefs.setBool('amoled', v);
+            if (mounted) setState(() {});
+          },
+        ),
+        SwitchListTile(
+          title: const Text('Flat bubbles'),
+          subtitle: const Text('Solid colours with no gradient or shadow.'),
+          value: Prefs.flat,
+          onChanged: (v) async {
+            await Prefs.setBool('flat_bubbles', v);
+            if (mounted) setState(() {});
+          },
+        ),
+        SwitchListTile(
+          title: const Text('Smooth animations'),
+          subtitle: const Text('Messages glide in and buttons morph. Turn off for instant UI.'),
+          value: Prefs.motion,
+          onChanged: (v) async {
+            await Prefs.setBool('motion', v);
+            if (mounted) setState(() {});
+          },
         ),
         header('Data and storage'),
         SwitchListTile(
