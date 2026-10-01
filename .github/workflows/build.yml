@@ -26,7 +26,9 @@ jobs:
       GOOGLE_WEB_CLIENT_ID: ${{ secrets.GOOGLE_WEB_CLIENT_ID }}
       GIPHY_API_KEY: ${{ secrets.GIPHY_API_KEY }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      OPENROUTER_API_KEYS: ${{ secrets.OPENROUTER_API_KEYS }}
       OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
+      OPENROUTER_FALLBACK_MODELS: ${{ secrets.OPENROUTER_FALLBACK_MODELS }}
       MAX_UPLOAD_MB: ${{ vars.MAX_UPLOAD_MB || '25' }}
       ANDROID_COMPILE_SDK: '36'
       ANDROID_TARGET_SDK: '36'
@@ -122,6 +124,11 @@ jobs:
               "android.permission.INTERNET",
               "android.permission.POST_NOTIFICATIONS",
               "android.permission.VIBRATE",
+              "android.permission.RECORD_AUDIO",
+              "android.permission.CAMERA",
+              "android.permission.READ_MEDIA_IMAGES",
+              "android.permission.READ_MEDIA_VIDEO",
+              "android.permission.READ_MEDIA_AUDIO",
           ]
           add_p = "".join('    <uses-permission android:name="%s"/>\n' % p for p in perms if p not in s)
           s = s.replace("<application", add_p + "    <application", 1)
@@ -288,7 +295,11 @@ jobs:
           PY
 
       - name: Get packages
-        run: flutter pub get
+        run: |
+          flutter pub add record path_provider video_player cached_network_image http uuid cryptography flutter_secure_storage flutter_local_notifications image_picker file_picker url_launcher shared_preferences sqflite supabase_flutter firebase_core firebase_auth google_sign_in || true
+          # permission_handler 12+ needs Android 16 (CINNAMON_BUN / ACCESS_LOCAL_NETWORK). Pin older plugin.
+          flutter pub add 'permission_handler:11.3.1' || true
+          flutter pub get
 
       - name: Build release APK (retries on flaky downloads)
         run: |
@@ -303,7 +314,9 @@ jobs:
               --dart-define=GOOGLE_WEB_CLIENT_ID="$GOOGLE_WEB_CLIENT_ID" \
               --dart-define=GIPHY_API_KEY="$GIPHY_API_KEY" \
               --dart-define=OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
-              --dart-define=OPENROUTER_MODEL="${OPENROUTER_MODEL:-qwen/qwen3.8-27b:free}" \
+              --dart-define=OPENROUTER_API_KEYS="$OPENROUTER_API_KEYS" \
+              --dart-define=OPENROUTER_MODEL="${OPENROUTER_MODEL:-openrouter/free}" \
+              --dart-define=OPENROUTER_FALLBACK_MODELS="$OPENROUTER_FALLBACK_MODELS" \
               --dart-define=MAX_UPLOAD_MB="$MAX_UPLOAD_MB"; then
               break
             fi
