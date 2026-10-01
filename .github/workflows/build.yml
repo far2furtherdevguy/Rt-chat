@@ -1,3 +1,339 @@
+name: Build RT Chat APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+      FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+      FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
+      FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+      FIREBASE_SENDER_ID: ${{ secrets.FIREBASE_SENDER_ID }}
+      GOOGLE_WEB_CLIENT_ID: ${{ secrets.GOOGLE_WEB_CLIENT_ID }}
+      GIPHY_API_KEY: ${{ secrets.GIPHY_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      OPENROUTER_API_KEYS: ${{ secrets.OPENROUTER_API_KEYS }}
+      OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
+      OPENROUTER_FALLBACK_MODELS: ${{ secrets.OPENROUTER_FALLBACK_MODELS }}
+      MAX_UPLOAD_MB: ${{ vars.MAX_UPLOAD_MB || '25' }}
+      ANDROID_COMPILE_SDK: '36'
+      ANDROID_TARGET_SDK: '36'
+      ANDROID_MIN_SDK: '23'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check required secrets
+        run: |
+          missing=""
+          for v in SUPABASE_URL SUPABASE_ANON_KEY; do
+            if [ -z "${!v}" ]; then missing="$missing $v"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::warning::Missing secrets:$missing - the APK will build but show a Setup needed screen."
+          fi
+          # Firebase secrets are optional (app uses local identity, not Google sign-in).
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Cache Gradle and Maven downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.m2/repository
+          key: gradle-${{ runner.os }}-${{ hashFiles('pubspec.yaml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Restore signing keystore
+        id: ks
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: rtchat-debug-keystore-v1
+
+      - name: Prepare signing keystore and print fingerprints
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkeypair -keystore ~/.android/debug.keystore -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+            echo "Created a new signing keystore."
+          fi
+          FP=$(keytool -list -v -keystore ~/.android/debug.keystore -alias androiddebugkey -storepass android | grep -E "SHA1:|SHA256:" | sed 's/^ *//')
+          echo "$FP"
+          {
+            echo "### Signing fingerprints (add the SHA-1 to your Firebase Android app)"
+            echo '```'
+            echo "$FP"
+            echo '```'
+            echo "Package name: \`com.rtchat.rt_chat\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create Android scaffold (if missing)
+        run: |
+          if [ ! -d android ]; then
+            flutter create --platforms=android --org com.rtchat --project-name rt_chat --no-pub /tmp/scaffold
+            cp -r /tmp/scaffold/android ./android
+          fi
+          mkdir -p android/app/src/main
+          ls android
+
+      - name: Patch Android project (label, permissions, SDK levels, desugaring)
+        run: |
+          python3 << 'PY'
+          import os, re, pathlib, textwrap
+          root = pathlib.Path("android")
+          compile_sdk = os.environ.get("ANDROID_COMPILE_SDK", "36")
+          target_sdk = os.environ.get("ANDROID_TARGET_SDK", "36")
+          min_sdk = os.environ.get("ANDROID_MIN_SDK", "23")
+
+          # Manifest: app name + permissions
+          mf = root / "app/src/main/AndroidManifest.xml"
+          s = mf.read_text()
+          s = re.sub(r'android:label="[^"]*"', 'android:label="RT Chat"', s, count=1)
+          perms = [
+              "android.permission.INTERNET",
+              "android.permission.POST_NOTIFICATIONS",
+              "android.permission.VIBRATE",
+              "android.permission.RECORD_AUDIO",
+              "android.permission.CAMERA",
+              "android.permission.READ_MEDIA_IMAGES",
+              "android.permission.READ_MEDIA_VIDEO",
+              "android.permission.READ_MEDIA_AUDIO",
+          ]
+          add_p = "".join('    <uses-permission android:name="%s"/>\n' % p for p in perms if p not in s)
+          s = s.replace("<application", add_p + "    <application", 1)
+          mf.write_text(s)
+
+          # App-level gradle (Kotlin DSL or Groovy)
+          g = None
+          for name in ("build.gradle.kts", "build.gradle"):
+              cand = root / "app" / name
+              if cand.exists():
+                  g = cand
+                  break
+          if g is None:
+              raise SystemExit("android/app/build.gradle(.kts) not found")
+          kts = g.name.endswith(".kts")
+          t = g.read_text()
+
+          def force_sdk(text, prop, version_prop, value):
+              if kts:
+                  if re.search(rf"(?m)^\s*{prop}\s*=", text):
+                      text = re.sub(rf"(?m)^(\s*){prop}\s*=\s*[^\n]+", rf"\1{prop} = {value}", text, count=1)
+                  elif re.search(rf"(?m)^\s*{version_prop}\s*=", text):
+                      text = re.sub(rf"(?m)^(\s*){version_prop}\s*=\s*[^\n]+", rf"\1{prop} = {value}", text, count=1)
+                  else:
+                      text = re.sub(r"(android\s*\{)", rf"\1\n    {prop} = {value}", text, count=1)
+              else:
+                  if re.search(rf"(?m)^\s*{version_prop}\s+", text):
+                      text = re.sub(rf"(?m)^(\s*){version_prop}\s+[^\n]+", rf"\1{version_prop} {value}", text, count=1)
+                  elif re.search(rf"(?m)^\s*{prop}\s+", text):
+                      text = re.sub(rf"(?m)^(\s*){prop}\s+[^\n]+", rf"\1{prop} {value}", text, count=1)
+                  else:
+                      text = re.sub(r"(android\s*\{)", rf"\1\n    {version_prop} {value}", text, count=1)
+              return text
+
+          t = force_sdk(t, "compileSdk", "compileSdkVersion", compile_sdk)
+          t = force_sdk(t, "targetSdk", "targetSdkVersion", target_sdk)
+          t = force_sdk(t, "minSdk", "minSdkVersion", min_sdk)
+          t = re.sub(r"flutter\.compileSdkVersion", compile_sdk, t)
+          t = re.sub(r"flutter\.targetSdkVersion", target_sdk, t)
+          t = re.sub(r"flutter\.minSdkVersion", min_sdk, t)
+
+          if "coreLibraryDesugaring" not in t and "isCoreLibraryDesugaringEnabled" not in t:
+              flag = "isCoreLibraryDesugaringEnabled = true" if kts else "coreLibraryDesugaringEnabled true"
+              if re.search(r"compileOptions\s*\{", t):
+                  t = re.sub(r"compileOptions\s*\{", lambda m: m.group(0) + "\n        " + flag, t, count=1)
+              else:
+                  if kts:
+                      inject = (
+                          "\n    compileOptions {\n        " + flag + "\n"
+                          "        sourceCompatibility = JavaVersion.VERSION_17\n"
+                          "        targetCompatibility = JavaVersion.VERSION_17\n    }\n"
+                      )
+                  else:
+                      inject = (
+                          "\n    compileOptions {\n        " + flag + "\n"
+                          "        sourceCompatibility JavaVersion.VERSION_17\n"
+                          "        targetCompatibility JavaVersion.VERSION_17\n    }\n"
+                      )
+                  t = re.sub(r"(android\s*\{)", r"\1" + inject, t, count=1)
+              dep = (
+                  'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")'
+                  if kts
+                  else "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'"
+              )
+              if re.search(r"dependencies\s*\{", t):
+                  t = re.sub(r"dependencies\s*\{", lambda m: m.group(0) + "\n    " + dep, t, count=1)
+              else:
+                  t += "\ndependencies {\n    " + dep + "\n}\n"
+
+          g.write_text(t)
+          print("Patched app gradle:", g)
+          print("  compileSdk/targetSdk/minSdk ->", compile_sdk, target_sdk, min_sdk)
+
+          # Force compileSdk on every Android subproject (file_picker, etc.)
+          marker = "forceCompileSdkForPlugins"
+          root_kts = root / "build.gradle.kts"
+          root_groovy = root / "build.gradle"
+
+          if root_kts.exists():
+              rb = root_kts
+              snippet = textwrap.dedent(
+                  """
+                  // forceCompileSdkForPlugins
+                  subprojects {
+                      fun Project.forceSdk() {
+                          val ext = extensions.findByName("android") ?: return
+                          try {
+                              ext.javaClass.methods
+                                  .find { it.name == "setCompileSdkVersion" && it.parameterCount == 1 }
+                                  ?.invoke(ext, __SDK__)
+                          } catch (_: Throwable) {}
+                          try {
+                              ext.javaClass.methods
+                                  .find { it.name == "setCompileSdk" && it.parameterCount == 1 }
+                                  ?.invoke(ext, __SDK__)
+                          } catch (_: Throwable) {}
+                      }
+                      // Safe: afterEvaluate fails if the project is already evaluated
+                      if (state.executed) {
+                          forceSdk()
+                      } else {
+                          afterEvaluate { forceSdk() }
+                      }
+                  }
+                  """
+              ).replace("__SDK__", compile_sdk)
+          else:
+              rb = root_groovy
+              snippet = textwrap.dedent(
+                  """
+                  // forceCompileSdkForPlugins
+                  subprojects { subproject ->
+                      def forceSdk = {
+                          if (subproject.plugins.hasPlugin("com.android.library") ||
+                              subproject.plugins.hasPlugin("com.android.application")) {
+                              def androidExt = subproject.extensions.findByName("android")
+                              if (androidExt != null) {
+                                  try { androidExt.compileSdkVersion = __SDK__ } catch (Throwable ignored) {}
+                                  try { androidExt.compileSdk = __SDK__ } catch (Throwable ignored) {}
+                              }
+                          }
+                      }
+                      if (subproject.state.executed) {
+                          forceSdk()
+                      } else {
+                          subproject.afterEvaluate { forceSdk() }
+                      }
+                  }
+                  """
+              ).replace("__SDK__", compile_sdk)
+
+          existing = rb.read_text() if rb.exists() else ""
+          if marker not in existing:
+              rb.write_text(existing.rstrip() + "\n" + snippet)
+              print("Forced compileSdk on all subprojects via", rb)
+          else:
+              print("Subproject compileSdk force already present in", rb)
+
+          (root / "app/proguard-rules.pro").write_text(
+              "-keep class com.dexterous.** { *; }\n"
+              "-keep class io.flutter.** { *; }\n"
+              "-keep class com.google.gson.** { *; }\n"
+              "-dontwarn com.google.android.play.core.**\n"
+          )
+
+          gp = root / "gradle.properties"
+          extra_lines = [
+              "org.gradle.caching=true",
+              "org.gradle.parallel=true",
+              "android.useAndroidX=true",
+              "android.nonTransitiveRClass=true",
+          ]
+          existing = gp.read_text() if gp.exists() else ""
+          for line in extra_lines:
+              if line not in existing:
+                  existing += "\n" + line
+          gp.write_text(existing.rstrip() + "\n")
+
+          print("--- app gradle SDK lines ---")
+          for line in g.read_text().splitlines():
+              if any(k in line for k in ("compileSdk", "targetSdk", "minSdk", "compileOptions", "desugar")):
+                  print(line)
+          # NOTE: Do not inject Groovy "android-plugin-fix" into build.gradle.kts
+          # (Flutter uses Kotlin DSL; p.plugins.hasPlugin("...") fails to compile).
+          # Subproject compileSdk is already forced above.
+
+          print("Android project patched successfully.")
+          PY
+
+      - name: Get packages
+        run: flutter pub get
+
+      - name: Build release APK (retries on flaky downloads)
+        run: |
+          for i in 1 2 3; do
+            if flutter build apk --release --target-platform android-arm,android-arm64 \
+              --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+              --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY" \
+              --dart-define=FIREBASE_API_KEY="$FIREBASE_API_KEY" \
+              --dart-define=FIREBASE_APP_ID="$FIREBASE_APP_ID" \
+              --dart-define=FIREBASE_PROJECT_ID="$FIREBASE_PROJECT_ID" \
+              --dart-define=FIREBASE_SENDER_ID="$FIREBASE_SENDER_ID" \
+              --dart-define=GOOGLE_WEB_CLIENT_ID="$GOOGLE_WEB_CLIENT_ID" \
+              --dart-define=GIPHY_API_KEY="$GIPHY_API_KEY" \
+              --dart-define=OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
+              --dart-define=OPENROUTER_API_KEYS="$OPENROUTER_API_KEYS" \
+              --dart-define=OPENROUTER_MODEL="${OPENROUTER_MODEL:-openrouter/free}" \
+              --dart-define=OPENROUTER_FALLBACK_MODELS="$OPENROUTER_FALLBACK_MODELS" \
+              --dart-define=MAX_UPLOAD_MB="$MAX_UPLOAD_MB"; then
+              break
+            fi
+            echo "Build attempt $i failed."
+            if [ "$i" -eq 3 ]; then exit 1; fi
+            sleep 20
+          done
+
+      - name: Name the APK
+        run: cp build/app/outputs/flutter-apk/app-release.apk RT-Chat.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RT-Chat-apk
+          path: RT-Chat.apk
+          retention-days: 30
 name: rt_chat
 description: RT Chat - fast, private realtime chat.
 publish_to: 'none'
