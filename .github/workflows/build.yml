@@ -291,14 +291,74 @@ jobs:
           for line in g.read_text().splitlines():
               if any(k in line for k in ("compileSdk", "targetSdk", "minSdk", "compileOptions", "desugar")):
                   print(line)
+          # Fix Kotlin-only subprojects missing com.android.library (android-plugin-fix)
+          root_gradle = root / "build.gradle"
+          if not root_gradle.exists():
+              root_gradle = root / "build.gradle.kts"
+          if root_gradle.exists():
+              gtxt = root_gradle.read_text()
+              if "android-plugin-fix" not in gtxt:
+                  if root_gradle.suffix == ".kts":
+                      gtxt += """
+
+// android-plugin-fix
+subprojects {
+    afterEvaluate {
+        val p = this
+        if (p.plugins.hasPlugin("org.jetbrains.kotlin.android")
+            && !p.plugins.hasPlugin("com.android.application")
+            && !p.plugins.hasPlugin("com.android.library")) {
+            p.plugins.apply("com.android.library")
+        }
+    }
+}
+"""
+                  else:
+                      gtxt += """
+
+// android-plugin-fix
+subprojects {
+    afterEvaluate { p ->
+        if (p.plugins.hasPlugin("org.jetbrains.kotlin.android") &&
+            !p.plugins.hasPlugin("com.android.application") &&
+            !p.plugins.hasPlugin("com.android.library")) {
+            p.plugins.apply("com.android.library")
+        }
+    }
+}
+"""
+                  root_gradle.write_text(gtxt)
+                  print("Applied android-plugin-fix to", root_gradle)
+
           print("Android project patched successfully.")
           PY
 
       - name: Get packages
         run: |
-          flutter pub add record path_provider video_player cached_network_image http uuid cryptography flutter_secure_storage flutter_local_notifications image_picker file_picker url_launcher shared_preferences sqflite supabase_flutter firebase_core firebase_auth google_sign_in || true
-          # permission_handler 12+ needs Android 16 (CINNAMON_BUN / ACCESS_LOCAL_NETWORK). Pin older plugin.
+          flutter pub add record path_provider video_player cached_network_image http uuid cryptography flutter_secure_storage image_picker file_picker url_launcher shared_preferences sqflite supabase_flutter firebase_core firebase_auth google_sign_in || true
+          # Pin versions that compile cleanly on CI (avoid permission_handler 12+ / notifications mismatches)
           flutter pub add 'permission_handler:11.3.1' || true
+          flutter pub add 'flutter_local_notifications:18.0.0' || true
+          # Force exact constraints in pubspec if pub add resolved differently
+          python3 << 'PIN'
+          from pathlib import Path
+          import re
+          p = Path("pubspec.yaml")
+          t = p.read_text()
+          pins = {
+              "permission_handler": "^11.3.1",
+              "flutter_local_notifications": "^18.0.0",
+          }
+          for name, ver in pins.items():
+              pat = rf"(?m)^(\s*{re.escape(name)}:\s*).*$"
+              if re.search(pat, t):
+                  t = re.sub(pat, rf"\1{ver}", t)
+              else:
+                  # insert under dependencies
+                  t = re.sub(r"(?m)^(dependencies:\s*)$", rf"\1\n  {name}: {ver}", t, count=1)
+          p.write_text(t)
+          print("Pinned:", pins)
+          PIN
           flutter pub get
 
       - name: Build release APK (retries on flaky downloads)
